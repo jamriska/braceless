@@ -12,7 +12,7 @@ It comes with wrappers for Clang, GCC, MSVC, and Emscripten: ``blclang``, ``blgc
 <tr>
 <td valign="top">
 
-```python
+```nim
 int clamp(int x, int lo, int hi):
     if x < lo:
         return lo
