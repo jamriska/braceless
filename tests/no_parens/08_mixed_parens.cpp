@@ -1,0 +1,24 @@
+// Mix of with and without parentheses
+int mixed(int x) {
+    // Without parens
+    if (x > 10) {
+        x *= 2;
+    }
+    
+    // With parens (still valid)
+    if (x < 5) {
+        x += 10;
+    }
+    
+    // Without parens
+    for (int i = 0; i < 3; i++) {
+        x++;
+    }
+    
+    // With parens (still valid)
+    while (x > 20) {
+        x--;
+    }
+    
+    return x;
+}

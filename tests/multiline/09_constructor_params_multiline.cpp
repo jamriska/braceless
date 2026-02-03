@@ -1,0 +1,15 @@
+class Calculator {
+    int a, b, c;
+    
+    Calculator(int first,
+               int second,
+               int third) {
+        a = first;
+        b = second;
+        c = third;
+    }
+    
+    int sum() {
+        return a + b + c;
+    }
+};

@@ -1,0 +1,20 @@
+int main():
+    // All colons here are NOT followed by newline+indent, so no braceless trigger
+    
+    // Regular C++ single-line if (no colon)
+    if (x > 0) return 1
+    
+    // Regular C++ for loop with braces
+    for (int i = 0; i < 10; i++) { printf("%d", i); }
+    
+    // Regular C++ single-line while
+    while (true) break
+    
+    // Case labels - colons are part of switch syntax
+    switch (x) {
+        case 1: printf("one"); break;
+        case 2: printf("two"); break;
+        default: printf("other");
+    }
+    
+    return 0

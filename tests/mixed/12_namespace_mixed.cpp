@@ -1,0 +1,15 @@
+namespace Outer {
+    namespace Inner {
+        class MyClass {
+            int value;
+            
+            void setValue(int v) {
+                value = v;
+            }
+        };
+    }
+    
+    int helper() {
+        return 42;
+    }
+}

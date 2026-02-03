@@ -1,0 +1,13 @@
+int add(int a, int b) {
+    return a + b;
+}
+
+int multiply(int a, int b) {
+    return a * b;
+}
+
+int main() {
+    int x = add(5, 3);
+    int y = multiply(2, 4);
+    return x + y;
+}

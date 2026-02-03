@@ -1,0 +1,26 @@
+int multilineTest(int x, int y, int z) {
+    // Multiline if condition without parens
+    if (x > 0 && 
+       y > 0 && 
+       z > 0) {
+        return 1;
+    }
+    
+    // Multiline for condition
+    for (int i = 0; 
+        i < 10; 
+        i++) {
+        x++;
+    }
+    
+    // Multiline while condition
+    while (x > 0 && 
+          y < 100 &&
+          z != 50) {
+        x--;
+        y++;
+        z++;
+    }
+    
+    return x + y + z;
+}

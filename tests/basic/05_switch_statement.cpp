@@ -1,0 +1,12 @@
+void print_grade(char grade) {
+    switch (grade) {
+        case 'A':
+            printf("Excellent");
+            break;
+        case 'B':
+            printf("Good");
+            break;
+        default:
+            printf("Invalid");
+    }
+}

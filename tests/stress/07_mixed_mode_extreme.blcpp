@@ -1,0 +1,39 @@
+// Test mixing braceless, braced, and optional parens extensively
+class MixedExtreme:
+private:
+    void method1():  // Braceless with colon
+        if x > 0 {   // Optional parens with regular brace
+            nested()
+        }
+        
+        // Traditional with parens and colon
+        if (y > 0):
+            action()
+        
+        // Multiline optional parens inside braceless
+        while complex &&
+              condition:
+            if (z > 0) { single(); }
+    
+public:
+    int compute(int a) {  // Regular braced function
+        if a < 0:         // Optional parens inside braced
+            return -1
+        
+        // Braceless for inside braced function
+        for int i = 0; i < 10; i++:
+            sum += i
+        
+        return sum
+    }
+    
+    void doWhileMixed():
+        do {              // Regular braced do
+            x++
+        } while x < 5     // Optional parens while
+        
+        do:               // Braceless do
+            y++
+        while (y < 10)    // Traditional parens while
+    
+    int x, y, sum

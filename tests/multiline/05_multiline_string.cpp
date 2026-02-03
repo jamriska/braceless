@@ -1,0 +1,6 @@
+int main() {
+    const char* msg = "This is a very long string that "
+                      "spans multiple lines and should "
+                      "be concatenated together";
+    return 0;
+}

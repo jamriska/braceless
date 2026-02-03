@@ -1,0 +1,33 @@
+// Test blank lines and comments at wrong indents
+class IndentTest:
+// Comment at column 0
+private:
+            // Over-indented comment
+    int a
+  // Under-indented comment
+    int b
+    
+    void method1():
+// Comment at column 0 inside method
+        int x = 1
+                    // Way over-indented
+        if x > 0:
+    // Under-indented inside if
+            return
+    
+public:
+    // Blank lines with various indents
+    void method2():
+        int y = 2
+        
+        if y > 0:
+            nested()
+        
+        more()
+    
+    // Access specifier after blank with wrong indent
+    void nested()
+  
+private:
+  // Under-indented before access specifier
+    void more()

@@ -1,0 +1,6 @@
+int main():
+    printf("Hello %d %d %d",
+           arg1,
+           arg2,
+           arg3)
+    return 0

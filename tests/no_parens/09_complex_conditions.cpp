@@ -1,0 +1,18 @@
+bool complexLogic(int a, int b, int c) {
+    // Complex boolean expressions without parens
+    if (a > 0 && b < 10 || c == 5) {
+        return true;
+    }
+    
+    // Complex loop condition
+    for (int i = 0; i < 100 && a > 0; i++) {
+        a--;
+    }
+    
+    // Nested expressions
+    while (a * 2 + b > c && c != 0) {
+        c--;
+    }
+    
+    return false;
+}

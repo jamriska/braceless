@@ -1,0 +1,12 @@
+int main() {
+    if (a) {
+        if (b) {
+            if (c) {
+                printf("Deep");
+            } else {
+                printf("Else");
+            }
+        }
+    }
+    return 0;
+}

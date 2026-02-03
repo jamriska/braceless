@@ -1,0 +1,278 @@
+#include <memory>
+#include <vector>
+#include <map>
+#include <string>
+#include <functional>
+#include <algorithm>
+#include <stdexcept>
+#include <iostream>
+
+// Forward declarations
+template <typename StateType>
+class StateMachine
+
+template <typename StateType>
+class State
+
+// Observer pattern for state change notifications
+template <typename StateType>
+class StateObserver:
+public:
+    virtual ~StateObserver() = default
+    virtual void onStateEnter(StateType state, const StateMachine<StateType>& machine) = 0
+    virtual void onStateExit(StateType state, const StateMachine<StateType>& machine) = 0
+    virtual void onTransition(StateType from, StateType to) = 0
+
+// Action that can be executed during transitions
+template <typename StateType, typename ContextType>
+class TransitionAction:
+public:
+    virtual ~TransitionAction() = default
+    virtual bool execute(StateType from, StateType to, ContextType& context) = 0
+    virtual std::string getName() const = 0
+
+// Concrete action using lambda
+template <typename StateType, typename ContextType>
+class LambdaAction : public TransitionAction<StateType, ContextType>:
+private:
+    std::string name
+    std::function<bool(StateType, StateType, ContextType&)> action
+    
+public:
+    LambdaAction(const std::string& name,
+                 std::function<bool(StateType, StateType, ContextType&)> func)
+        : name(name), action(func) {}
+    
+    bool execute(StateType from, StateType to, ContextType& context) override:
+        try:
+            return action(from, to, context)
+        catch (const std::exception& e):
+            std::cerr << "Action '" << name << "' failed: " << e.what() << std::endl
+            return false
+    
+    std::string getName() const override:
+        return name
+
+// Transition with conditions and actions
+template <typename StateType, typename ContextType>
+class Transition:
+private:
+    StateType fromState
+    StateType toState
+    std::function<bool(const ContextType&)> condition
+    std::vector<std::shared_ptr<TransitionAction<StateType, ContextType>>> actions
+    int priority
+    
+public:
+    Transition(StateType from, StateType to, int priority = 0)
+        : fromState(from), toState(to), priority(priority):
+        condition = [](const ContextType&) { return true; }
+    
+    void setCondition(std::function<bool(const ContextType&)> cond):
+        condition = cond
+    
+    void addAction(std::shared_ptr<TransitionAction<StateType, ContextType>> action):
+        actions.push_back(action)
+    
+    bool canTransition(const ContextType& context) const:
+        return condition(context)
+    
+    bool executeActions(ContextType& context):
+        for (auto& action : actions):
+            if (!action->execute(fromState, toState, context)):
+                return false
+        return true
+    
+    StateType getFromState() const { return fromState; }
+    StateType getToState() const { return toState; }
+    int getPriority() const { return priority; }
+    
+    bool operator<(const Transition& other) const:
+        return priority > other.priority  // Higher priority first
+
+// State with enter/exit callbacks
+template <typename StateType>
+class State:
+private:
+    StateType id
+    std::function<void()> onEnter
+    std::function<void()> onExit
+    std::map<std::string, std::function<void()>> updateCallbacks
+    
+public:
+    explicit State(StateType id) : id(id) {}
+    
+    void setOnEnter(std::function<void()> callback):
+        onEnter = callback
+    
+    void setOnExit(std::function<void()> callback):
+        onExit = callback
+    
+    void addUpdateCallback(const std::string& name, std::function<void()> callback):
+        updateCallbacks[name] = callback
+    
+    void enter():
+        if (onEnter):
+            onEnter()
+    
+    void exit():
+        if (onExit):
+            onExit()
+    
+    void update():
+        for (auto& pair : updateCallbacks):
+            pair.second()
+    
+    StateType getId() const { return id; }
+
+// Main state machine
+template <typename StateType, typename ContextType>
+class StateMachine:
+private:
+    std::map<StateType, std::shared_ptr<State<StateType>>> states
+    std::vector<std::shared_ptr<Transition<StateType, ContextType>>> transitions
+    std::vector<std::weak_ptr<StateObserver<StateType>>> observers
+    
+    StateType currentState
+    ContextType context
+    bool initialized
+    
+    void notifyObserversEnter(StateType state):
+        cleanupObservers()
+        for (auto& weakObs : observers):
+            if (auto obs = weakObs.lock()):
+                obs->onStateEnter(state, *this)
+    
+    void notifyObserversExit(StateType state):
+        cleanupObservers()
+        for (auto& weakObs : observers):
+            if (auto obs = weakObs.lock()):
+                obs->onStateExit(state, *this)
+    
+    void notifyObserversTransition(StateType from, StateType to):
+        cleanupObservers()
+        for (auto& weakObs : observers):
+            if (auto obs = weakObs.lock()):
+                obs->onTransition(from, to)
+    
+    void cleanupObservers():
+        observers.erase(
+            std::remove_if(observers.begin(), observers.end(),
+                          [](const std::weak_ptr<StateObserver<StateType>>& weak):
+                              return weak.expired()
+            ),
+            observers.end()
+        )
+
+public:
+    StateMachine() : initialized(false) {}
+    
+    void addState(StateType stateId):
+        if (states.find(stateId) == states.end()):
+            states[stateId] = std::make_shared<State<StateType>>(stateId)
+    
+    std::shared_ptr<State<StateType>> getState(StateType stateId):
+        auto it = states.find(stateId)
+        if (it == states.end()):
+            throw std::runtime_error("State not found")
+        return it->second
+    
+    void addTransition(std::shared_ptr<Transition<StateType, ContextType>> transition):
+        transitions.push_back(transition)
+        std::sort(transitions.begin(), transitions.end(),
+                 [](const auto& a, const auto& b):
+                     return *a < *b
+        )
+    
+    void addObserver(std::shared_ptr<StateObserver<StateType>> observer):
+        observers.push_back(observer)
+    
+    void initialize(StateType initialState):
+        if (states.find(initialState) == states.end()):
+            throw std::runtime_error("Initial state not found")
+        
+        currentState = initialState
+        initialized = true
+        
+        auto state = states[currentState]
+        state->enter()
+        notifyObserversEnter(currentState)
+    
+    bool tryTransition(StateType targetState):
+        if (!initialized):
+            throw std::runtime_error("State machine not initialized")
+        
+        // Find valid transitions
+        std::vector<std::shared_ptr<Transition<StateType, ContextType>>> validTransitions
+        
+        for (auto& transition : transitions):
+            if (transition->getFromState() == currentState &&
+                transition->getToState() == targetState &&
+                transition->canTransition(context)):
+                validTransitions.push_back(transition)
+        
+        if (validTransitions.empty()):
+            return false
+        
+        // Execute highest priority transition
+        auto transition = validTransitions[0]
+        
+        // Exit current state
+        auto currentStateObj = states[currentState]
+        currentStateObj->exit()
+        notifyObserversExit(currentState)
+        
+        // Execute transition actions
+        if (!transition->executeActions(context)):
+            // Rollback on action failure
+            currentStateObj->enter()
+            notifyObserversEnter(currentState)
+            return false
+        
+        // Notify observers
+        notifyObserversTransition(currentState, targetState)
+        
+        // Enter new state
+        currentState = targetState
+        auto newStateObj = states[currentState]
+        newStateObj->enter()
+        notifyObserversEnter(currentState)
+        
+        return true
+    
+    void update():
+        if (!initialized) return
+        
+        auto state = states[currentState]
+        state->update()
+    
+    StateType getCurrentState() const:
+        return currentState
+    
+    ContextType& getContext():
+        return context
+    
+    const ContextType& getContext() const:
+        return context
+    
+    bool isInitialized() const:
+        return initialized
+
+// Example usage: Game character AI
+enum class CharacterState:
+    IDLE,
+    WALKING,
+    RUNNING,
+    JUMPING,
+    ATTACKING,
+    DEAD
+
+struct CharacterContext:
+    float health
+    float stamina
+    float speed
+    bool isGrounded
+    bool enemyInRange
+    
+    CharacterContext() : health(100.0f), stamina(100.0f), speed(0.0f),
+                        isGrounded(true), enemyInRange(false) {}

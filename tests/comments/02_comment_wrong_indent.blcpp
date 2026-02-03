@@ -1,0 +1,9 @@
+int test():
+    int a = 1
+// Comment at column 0 - should be ignored
+    int b = 2
+            // Comment over-indented - should be ignored
+    if (a < b):
+  // Comment under-indented - should be ignored
+        return b
+    return a

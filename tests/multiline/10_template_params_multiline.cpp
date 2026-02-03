@@ -1,0 +1,12 @@
+template <typename T>
+T max(T a,
+      T b,
+      T c) {
+    if (a > b && a > c) {
+        return a;
+    }
+    if (b > c) {
+        return b;
+    }
+    return c;
+}

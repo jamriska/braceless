@@ -1,0 +1,10 @@
+int main() {
+    // This is a comment
+    int x = 5;
+    // Another comment
+    if (x > 0) {
+        // Comment inside block
+        return x;
+    }
+    return 0;
+}

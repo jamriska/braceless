@@ -1,0 +1,115 @@
+#include <cmath>
+#include <iostream>
+
+struct Vec3 {
+    float x, y, z;
+    
+    Vec3() : x(0), y(0), z(0) {}
+    Vec3(float x, float y, float z) : x(x), y(y), z(z) {}
+    
+    Vec3 operator+(const Vec3& other) const {
+        return Vec3(x + other.x, y + other.y, z + other.z);
+    }
+    
+    Vec3 operator-(const Vec3& other) const {
+        return Vec3(x - other.x, y - other.y, z - other.z);
+    }
+    
+    Vec3 operator*(float scalar) const {
+        return Vec3(x * scalar, y * scalar, z * scalar);
+    }
+    
+    float dot(const Vec3& other) const {
+        return x * other.x + y * other.y + z * other.z;
+    }
+    
+    Vec3 cross(const Vec3& other) const {
+        return Vec3(
+            y * other.z - z * other.y,
+            z * other.x - x * other.z,
+            x * other.y - y * other.x
+        );
+    }
+    
+    float length() const {
+        return std::sqrt(x * x + y * y + z * z);
+    }
+    
+    Vec3 normalize() const {
+        float len = length();
+        if (len < 0.0001f) {
+            return Vec3(0, 0, 0);
+        }
+        return Vec3(x / len, y / len, z / len);
+    }
+    
+    void print() const {
+        std::cout << "(" << x << ", " << y << ", " << z << ")";
+    }
+};
+
+class Matrix4 {
+private:
+    float m[16];
+    
+public:
+    Matrix4() {
+        for (int i = 0; i < 16; i++) {
+            m[i] = 0.0f;
+        }
+    }
+    
+    static Matrix4 identity() {
+        Matrix4 result;
+        result.m[0] = result.m[5] = result.m[10] = result.m[15] = 1.0f;
+        return result;
+    }
+    
+    static Matrix4 translation(float x, float y, float z) {
+        Matrix4 result = identity();
+        result.m[12] = x;
+        result.m[13] = y;
+        result.m[14] = z;
+        return result;
+    }
+    
+    static Matrix4 scale(float x, float y, float z) {
+        Matrix4 result = identity();
+        result.m[0] = x;
+        result.m[5] = y;
+        result.m[10] = z;
+        return result;
+    }
+    
+    static Matrix4 rotationX(float angle) {
+        Matrix4 result = identity();
+        float c = std::cos(angle);
+        float s = std::sin(angle);
+        result.m[5] = c;
+        result.m[6] = -s;
+        result.m[9] = s;
+        result.m[10] = c;
+        return result;
+    }
+    
+    Matrix4 operator*(const Matrix4& other) const {
+        Matrix4 result;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                float sum = 0;
+                for (int k = 0; k < 4; k++) {
+                    sum += m[i * 4 + k] * other.m[k * 4 + j];
+                }
+                result.m[i * 4 + j] = sum;
+            }
+        }
+        return result;
+    }
+    
+    Vec3 transform(const Vec3& v) const {
+        float x = m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12];
+        float y = m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13];
+        float z = m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14];
+        return Vec3(x, y, z);
+    }
+};

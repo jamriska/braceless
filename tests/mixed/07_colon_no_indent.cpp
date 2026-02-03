@@ -1,0 +1,14 @@
+int main() {
+    // Ternary operator - colons inside expression
+    int x = (a > b) ? a : b;
+    
+    // Regular C++ for loop - no colon at all
+    for (int i = 0; i < 10; i++) printf("inline");
+    
+    // Braceless if - colon with newline+indent triggers braceless
+    if (x > 0) {
+        return 1;
+    }
+    
+    return 0;
+}

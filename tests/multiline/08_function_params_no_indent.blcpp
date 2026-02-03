@@ -1,0 +1,11 @@
+int process(
+    int a,
+    int b,
+    int c):
+    return a + b + c
+
+void handler(int x,
+             int y,
+             int z) {
+    printf("%d", x + y + z);
+}

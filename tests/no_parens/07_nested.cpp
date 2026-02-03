@@ -1,0 +1,17 @@
+int nestedControl(int x, int y) {
+    if (x > 0) {
+        for (int i = 0; i < x; i++) {
+            if (y > 0) {
+                while (y > 0) {
+                    y--;
+                    if (y == 5) {
+                        break;
+                    }
+                }
+            }
+        }
+        return 1;
+    } else {
+        return 0;
+    }
+}

@@ -1,0 +1,127 @@
+#include <functional>
+#include <vector>
+#include <map>
+#include <string>
+#include <memory>
+#include <algorithm>
+
+class Event {
+public:
+    virtual ~Event() = default;
+    virtual std::string getType() const = 0;
+};
+
+class KeyEvent : public Event {
+private:
+    int keyCode;
+    bool pressed;
+    
+public:
+    KeyEvent(int code, bool isPressed) : keyCode(code), pressed(isPressed) {}
+    
+    std::string getType() const override { return "KeyEvent"; }
+    int getKeyCode() const { return keyCode; }
+    bool isPressed() const { return pressed; }
+};
+
+class MouseEvent : public Event {
+private:
+    int x, y;
+    int button;
+    
+public:
+    MouseEvent(int x, int y, int btn) : x(x), y(y), button(btn) {}
+    
+    std::string getType() const override { return "MouseEvent"; }
+    int getX() const { return x; }
+    int getY() const { return y; }
+    int getButton() const { return button; }
+};
+
+class EventListener {
+public:
+    virtual ~EventListener() = default;
+    virtual void onEvent(const Event& event) = 0;
+    virtual int getPriority() const { return 0; }
+};
+
+class EventDispatcher {
+private:
+    struct ListenerEntry {
+        std::shared_ptr<EventListener> listener;
+        int priority;
+        
+        bool operator<(const ListenerEntry& other) const {
+            return priority > other.priority;  // Higher priority first
+        }
+    };
+    
+    std::map<std::string, std::vector<ListenerEntry>> listeners;
+    std::vector<std::shared_ptr<Event>> eventQueue;
+    bool isDispatching;
+    
+public:
+    EventDispatcher() : isDispatching(false) {}
+    
+    void addEventListener(const std::string& eventType,
+                         std::shared_ptr<EventListener> listener) {
+        ListenerEntry entry;
+        entry.listener = listener;
+        entry.priority = listener->getPriority();
+        
+        auto& listenerList = listeners[eventType];
+        listenerList.push_back(entry);
+        
+        // Sort by priority
+        std::sort(listenerList.begin(), listenerList.end());
+    }
+    
+    void removeEventListener(const std::string& eventType,
+                            std::shared_ptr<EventListener> listener) {
+        auto it = listeners.find(eventType);
+        if (it == listeners.end()) return;
+        
+        auto& listenerList = it->second;
+        listenerList.erase(
+            std::remove_if(listenerList.begin(), listenerList.end(),
+                          [&](const ListenerEntry& entry) {
+                              return entry.listener == listener;
+                          }
+            ),
+            listenerList.end()
+        );
+    }
+    
+    void queueEvent(std::shared_ptr<Event> event) {
+        eventQueue.push_back(event);
+    }
+    
+    void dispatchEvent(const Event& event) {
+        auto it = listeners.find(event.getType());
+        if (it == listeners.end()) return;
+        
+        isDispatching = true;
+        for (const auto& entry : it->second) {
+            entry.listener->onEvent(event);
+        }
+        isDispatching = false;
+    }
+    
+    void processQueue() {
+        if (isDispatching) return;
+        
+        while (!eventQueue.empty()) {
+            auto event = eventQueue.front();
+            eventQueue.erase(eventQueue.begin());
+            dispatchEvent(*event);
+        }
+    }
+    
+    void clearQueue() {
+        eventQueue.clear();
+    }
+    
+    size_t getQueueSize() const {
+        return eventQueue.size();
+    }
+};

@@ -1,0 +1,6 @@
+// Test that tabs in strings are preserved, not confused with indentation
+void string_tabs() {
+	print("hello\tworld");
+	print("col1\tcol2\tcol3");
+	char* tab = "\t";
+}

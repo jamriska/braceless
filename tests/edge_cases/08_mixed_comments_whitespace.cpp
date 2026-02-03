@@ -1,0 +1,16 @@
+int complex() {
+    int a = 1;    // trailing space after this comment    
+    
+  // under-indented comment
+    int b = 2;
+            // over-indented comment
+    
+    if (a < b) {    
+                // blank lines with various whitespace
+        
+        // comment in block
+        return b;    
+        
+    }
+    return a;
+}

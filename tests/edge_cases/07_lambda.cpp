@@ -1,0 +1,8 @@
+int main() {
+    auto lambda = [](int x) {
+        return x * 2;
+    };
+    
+    int result = lambda(5);
+    return result;
+}

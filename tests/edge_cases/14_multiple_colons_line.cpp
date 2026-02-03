@@ -1,0 +1,7 @@
+int main() {
+    int x = (a > b) ? a : b;
+    for (int i = 0; i < 10; i++) {
+        std::cout << i << ": value" << std::endl;
+    }
+    return 0;
+}

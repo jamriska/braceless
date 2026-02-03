@@ -1,0 +1,9 @@
+namespace MyNamespace {
+    class MyClass {
+        int value;
+        
+        void setValue(int v) {
+            value = v;
+        }
+    };
+}
