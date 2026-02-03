@@ -1,6 +1,7 @@
 # Braceless C++
 
-Braceless C++ is a dialect of C++ that uses indentation instead of braces and compiles to regular C++:
+Braceless C++ lets you write C++ using indentation instead of braces. It transpiles to standard C++ and works with Clang, GCC, MSVC, and Emscripten.
+
 <table>
 <tr>
 <th>Braceless C++</th>
@@ -54,8 +55,6 @@ int main() {
 </table>
 
 Braceless C++ is backwards compatible with regular C++. You can freely mix indented code and brace-delimited code in the same source file. Trailing semicolons and parentheses in control structures are optional.
-
-It comes with wrappers for Clang, GCC, MSVC, and Emscripten: ``blclang``, ``blgcc``, ``blcl``, ``blemcc``.
 
 ## Usage
 
