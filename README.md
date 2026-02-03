@@ -56,6 +56,8 @@ int main() {
 </tr>
 </table>
 
+Braceless C++ is backwards compatible with regular C++. You can freely mix indented code and brace-delimited code in the same source file. Trailing semicolons and parentheses in control structures are optional.
+
 ## Usage
 
 Use the wrapper that corresponds to your compiler:
