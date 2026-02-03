@@ -1,0 +1,18 @@
+#!/bin/sh
+# Find Python
+if [ -z "$PYTHON" ]; then
+  PYTHON=$(command -v python3 2> /dev/null)
+fi
+if [ -z "$PYTHON" ]; then
+  PYTHON=$(command -v python 2> /dev/null)
+fi
+if [ -z "$PYTHON" ]; then
+  echo 'unable to find python in $PATH' >&2
+  exit 1
+fi
+
+# Get wrapper name from script name
+WRAPPER=$(basename "$0")
+SCRIPT_DIR=$(dirname "$0")
+
+exec "$PYTHON" -E "$SCRIPT_DIR/blcc.py" --wrapper "$WRAPPER" "$@"
