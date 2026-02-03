@@ -1,0 +1,13 @@
+#include "macros.blh"
+
+int main():
+    int x = clampValue(150)
+    int y = clampValue(-10)
+
+    Bounded b
+    b.set(50)
+    int z = b.get()
+
+    LOG("test message")
+
+    return x + y + z

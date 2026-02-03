@@ -1,0 +1,12 @@
+// Both user1 and user2 include guarded.blh
+// Include guard should prevent double definition
+#include "user1.blh"
+#include "user2.blh"
+#include "guarded.blh"
+
+int main():
+    User1 u1
+    User2 u2
+    GuardedClass g(5)
+
+    return u1.use() + u2.use() + g.getValue()

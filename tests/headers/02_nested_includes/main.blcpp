@@ -1,0 +1,15 @@
+#include "geometry.blh"
+
+int main():
+    Point p(10, 20)
+    Size s(100, 50)
+    Rectangle rect(p, s)
+
+    int a = rect.area()
+
+    Point test(50, 40)
+    if rect.contains(test):
+        a += 1
+
+    Point center = rect.getCenter()
+    return center.x + center.y + a

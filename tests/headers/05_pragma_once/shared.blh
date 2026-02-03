@@ -1,0 +1,7 @@
+// Shared header with pragma once
+#pragma once
+
+constexpr int SHARED_CONSTANT = 42
+
+inline int sharedFunction(int x):
+    return x + SHARED_CONSTANT

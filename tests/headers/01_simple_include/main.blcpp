@@ -1,0 +1,11 @@
+#include "math_utils.blh"
+
+int main():
+    int result = add(3, 4)
+    result = multiply(result, 2)
+
+    Calculator calc
+    calc.add(10)
+    calc.subtract(3)
+
+    return calc.get() + result

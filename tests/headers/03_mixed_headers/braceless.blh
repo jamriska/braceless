@@ -1,0 +1,18 @@
+// Braceless header
+#pragma once
+
+#include "regular.h"
+
+class BracelessClass:
+private:
+    RegularStruct data
+
+public:
+    BracelessClass() {}
+    BracelessClass(int v) : data(v) {}
+
+    int process():
+        int val = data.getValue()
+        val = regularFunction(val)
+        data.setValue(val)
+        return val

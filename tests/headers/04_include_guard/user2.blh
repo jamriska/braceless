@@ -1,0 +1,13 @@
+// Second user of guarded header
+#pragma once
+
+#include "guarded.blh"
+
+class User2:
+private:
+    GuardedClass obj
+
+public:
+    int use():
+        obj.setValue(20)
+        return obj.getValue()

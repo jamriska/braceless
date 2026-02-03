@@ -1,0 +1,6 @@
+#include "mylib.blh"
+
+int main():
+    int x = mylib_add(5, 3)
+    MyClass obj(10)
+    return x + obj.get()

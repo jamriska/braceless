@@ -1270,18 +1270,192 @@ def is_blcpp_file(filepath: str) -> bool:
     return filepath.lower().endswith('.blcpp')
 
 
-def transpile_file(source_path: str, output_path: str) -> LineMapper:
-    """Transpile a braceless C++ file to regular C++."""
-    with open(source_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+def is_blh_file(filepath: str) -> bool:
+    """Check if a file is a braceless C++ header"""
+    return filepath.lower().endswith('.blh')
+
+
+# Pattern to match #include "*.blh" directives
+BLH_INCLUDE_PATTERN = re.compile(r'^(\s*)#\s*include\s*"([^"]*\.blh)"', re.IGNORECASE)
+
+
+def resolve_include(filename: str, search_dirs: List[str]) -> Optional[str]:
+    """Find a header file in search directories.
     
+    Args:
+        filename: The filename from the #include directive
+        search_dirs: List of directories to search
+        
+    Returns:
+        Absolute path to the file if found, None otherwise
+    """
+    for dir_path in search_dirs:
+        full_path = os.path.join(dir_path, filename)
+        if os.path.exists(full_path):
+            return os.path.abspath(full_path)
+    return None
+
+
+def expand_blh_includes(
+    source_path: str,
+    include_dirs: List[str] = None,
+    included_files: Set[str] = None
+) -> Tuple[List[str], Dict[int, Tuple[str, int]]]:
+    """Expand all #include "*.blh" directives recursively.
+    
+    This function reads a source file and inlines any .blh headers it includes,
+    tracking the original source location of each line.
+    
+    Args:
+        source_path: Path to the source file to process
+        include_dirs: Additional directories to search for headers
+        included_files: Set of already-included files (for #pragma once handling)
+        
+    Returns:
+        Tuple of:
+        - lines: List of lines with .blh content inlined
+        - line_map: Dict mapping output_line_num -> (original_file, original_line_num)
+    """
+    if included_files is None:
+        included_files = set()
+    
+    source_path = os.path.abspath(source_path)
+    source_dir = os.path.dirname(source_path)
+    search_dirs = [source_dir] + (include_dirs or [])
+    
+    lines = []
+    line_map = {}
+    
+    try:
+        with open(source_path, 'r', encoding='utf-8') as f:
+            source_lines = f.readlines()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Cannot open source file: {source_path}")
+    
+    for src_line_num, line in enumerate(source_lines, 1):
+        match = BLH_INCLUDE_PATTERN.match(line)
+        
+        if match:
+            indent = match.group(1)
+            blh_name = match.group(2)
+            blh_path = resolve_include(blh_name, search_dirs)
+            
+            if blh_path is None:
+                # Header not found - keep the include line as-is
+                # The C++ compiler will report the error
+                output_line = len(lines) + 1
+                lines.append(line)
+                line_map[output_line] = (source_path, src_line_num)
+            elif blh_path in included_files:
+                # Already included (handles #pragma once semantics)
+                # Skip this include entirely
+                pass
+            else:
+                # Expand the header
+                included_files.add(blh_path)
+                sub_lines, sub_map = expand_blh_includes(blh_path, include_dirs, included_files)
+                
+                # Add all lines from the included file
+                base_output_line = len(lines)
+                for i, sub_line in enumerate(sub_lines):
+                    output_line = base_output_line + i + 1
+                    lines.append(sub_line)
+                    # Copy the source location from the sub-expansion
+                    line_map[output_line] = sub_map[i + 1]
+        else:
+            # Regular line - add it with its source location
+            output_line = len(lines) + 1
+            lines.append(line)
+            line_map[output_line] = (source_path, src_line_num)
+    
+    return lines, line_map
+
+
+def extract_include_dirs(args: List[str]) -> List[str]:
+    """Extract include directories from compiler arguments.
+    
+    Handles both -I dir and -Idir forms.
+    """
+    include_dirs = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '-I' and i + 1 < len(args):
+            include_dirs.append(args[i + 1])
+            i += 2
+        elif arg.startswith('-I'):
+            include_dirs.append(arg[2:])
+            i += 1
+        elif arg.startswith('/I'):  # MSVC style
+            if len(arg) > 2:
+                include_dirs.append(arg[2:])
+            elif i + 1 < len(args):
+                include_dirs.append(args[i + 1])
+                i += 1
+            i += 1
+        else:
+            i += 1
+    return include_dirs
+
+
+class SourceLocationMapper:
+    """Maps transpiled line numbers back to original source file locations.
+    
+    This handles the case where .blh files have been expanded inline,
+    so errors can be reported with the correct original file and line.
+    """
+    
+    def __init__(self, blh_line_map: Dict[int, Tuple[str, int]], transpile_mapper: LineMapper):
+        """
+        Args:
+            blh_line_map: Maps expanded_line -> (original_file, original_line)
+            transpile_mapper: Maps transpiled_line -> expanded_line
+        """
+        self._blh_map = blh_line_map
+        self._transpile_mapper = transpile_mapper
+    
+    def get_source_location(self, transpiled_line: int) -> Tuple[str, int]:
+        """Get the original source file and line for a transpiled line number.
+        
+        Returns:
+            Tuple of (original_file_path, original_line_number)
+        """
+        # First map transpiled line to expanded line
+        expanded_line = self._transpile_mapper.get_source_line(transpiled_line)
+        # Then map expanded line to original source location
+        if expanded_line in self._blh_map:
+            return self._blh_map[expanded_line]
+        # Fallback: return unknown location
+        return ("<unknown>", expanded_line)
+
+
+def transpile_file(source_path: str, output_path: str, include_dirs: List[str] = None) -> SourceLocationMapper:
+    """Transpile a braceless C++ file to regular C++.
+    
+    This function expands any #include "*.blh" directives, transpiles the
+    combined braceless code to braced C++, and returns a mapper that can
+    translate transpiled line numbers back to original source locations.
+    
+    Args:
+        source_path: Path to the .blcpp source file
+        output_path: Path where the transpiled .cpp will be written
+        include_dirs: Additional directories to search for .blh headers
+        
+    Returns:
+        SourceLocationMapper for mapping error line numbers back to original files
+    """
+    # Expand .blh includes recursively
+    lines, blh_line_map = expand_blh_includes(source_path, include_dirs)
+    
+    # Transpile the expanded content
     compiler = MappingCompiler(lines)
     output = compiler.compile()
     
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(output)
     
-    return compiler.line_mapper
+    # Return a mapper that chains: transpiled_line -> expanded_line -> (file, line)
+    return SourceLocationMapper(blh_line_map, compiler.line_mapper)
 
 
 def expand_response_file(response_file: str) -> List[str]:
@@ -1428,7 +1602,7 @@ def _paths_match(path1: str, path2: str) -> bool:
     return os.path.basename(path1).lower() == os.path.basename(path2).lower()
 
 
-def _build_basename_map(file_mappings: Dict[str, Tuple[str, LineMapper]]) -> Dict[str, str]:
+def _build_basename_map(file_mappings: Dict[str, SourceLocationMapper]) -> Dict[str, str]:
     """Build a map of basenames to temp paths"""
     basename_to_temp = {}
     for temp_path in file_mappings:
@@ -1440,10 +1614,22 @@ def _build_basename_map(file_mappings: Dict[str, Tuple[str, LineMapper]]) -> Dic
 
 def patch_compiler_output(
     output: str,
-    file_mappings: Dict[str, Tuple[str, LineMapper]],
+    file_mappings: Dict[str, SourceLocationMapper],
     error_format: ErrorFormat
 ) -> str:
-    """Patch compiler output to map line numbers back to original source files."""
+    """Patch compiler output to map line numbers back to original source files.
+    
+    This handles errors from transpiled .cpp files, mapping them back to the
+    original .blcpp or .blh source files and line numbers.
+    
+    Args:
+        output: Compiler stdout or stderr
+        file_mappings: Maps temp_cpp_path -> SourceLocationMapper
+        error_format: MSVC or GNU error message format
+        
+    Returns:
+        Patched output with corrected file paths and line numbers
+    """
     basename_to_temp = _build_basename_map(file_mappings)
     lines = output.split('\n')
     patched_lines = []
@@ -1468,13 +1654,16 @@ def patch_compiler_output(
                     matched_temp_path = basename_to_temp[basename]
             
             if matched_temp_path:
-                original_path, mapper = file_mappings[matched_temp_path]
-                source_line = mapper.get_source_line(line_num)
+                mapper = file_mappings[matched_temp_path]
+                # Get the original source file and line
+                original_path, source_line = mapper.get_source_location(line_num)
                 
                 if error_format == ErrorFormat.MSVC:
                     column_part = match.group(3) or ''
                     old_loc = f'({line_num}{column_part})'
                     new_loc = f'({source_line}{column_part})'
+                    line = line.replace(filepath, original_path, 1)
+                    line = line.replace(old_loc, new_loc, 1)
                 else:
                     col_part = match.group(3)
                     if col_part:
@@ -1483,11 +1672,6 @@ def patch_compiler_output(
                     else:
                         old_loc = f'{filepath}:{line_num}:'
                         new_loc = f'{original_path}:{source_line}:'
-                
-                line = line.replace(filepath, original_path, 1)
-                if error_format == ErrorFormat.MSVC:
-                    line = line.replace(old_loc, new_loc, 1)
-                else:
                     line = line.replace(old_loc, new_loc, 1)
         
         patched_lines.append(line)
@@ -1520,6 +1704,9 @@ def run_compiler_wrapper(
     if verbose:
         print(f"[{wrapper_name}] Temp directory: {temp_dir}", file=sys.stderr)
     
+    # Extract include directories for .blh resolution
+    include_dirs = extract_include_dirs(all_args)
+    
     try:
         file_mappings = {}
         new_args = list(all_args)
@@ -1532,14 +1719,14 @@ def run_compiler_wrapper(
             try:
                 if verbose:
                     print(f"[{wrapper_name}] Transpiling: {original_path} -> {temp_path}", file=sys.stderr)
-                mapper = transpile_file(original_path, temp_path)
-                file_mappings[temp_path] = (original_path, mapper)
+                mapper = transpile_file(original_path, temp_path, include_dirs)
+                file_mappings[temp_path] = mapper
                 
                 for i, arg in enumerate(new_args):
                     if arg == original_path:
                         new_args[i] = temp_path
-            except FileNotFoundError:
-                print(f"{wrapper_name}: error: cannot open source file '{original_path}'", file=sys.stderr)
+            except FileNotFoundError as e:
+                print(f"{wrapper_name}: error: {e}", file=sys.stderr)
                 return 1
             except Exception as e:
                 print(f"{wrapper_name}: error transpiling {original_path}: {e}", file=sys.stderr)
@@ -1630,26 +1817,40 @@ def main():
     
     # Otherwise, run as transpiler
     if len(sys.argv) < 2:
-        print("Usage: blcc <input.blcpp>", file=sys.stderr)
+        print("Usage: blcc <input.blcpp> [-I<include_dir>]...", file=sys.stderr)
         print("       blcc --wrapper <name> [compiler options] <source files>", file=sys.stderr)
         sys.exit(1)
     
-    filename = sys.argv[1]
+    # Parse arguments
+    filename = None
+    include_dirs = []
+    
+    for arg in sys.argv[1:]:
+        if arg.startswith('-I'):
+            include_dirs.append(arg[2:])
+        elif arg == '-I':
+            continue  # Next arg will be the directory
+        elif not filename:
+            filename = arg
+        elif sys.argv[sys.argv.index(arg) - 1] == '-I':
+            include_dirs.append(arg)
+    
+    if not filename:
+        print("Error: No input file specified", file=sys.stderr)
+        sys.exit(1)
     
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        print(f"Error: Could not open file {filename}", file=sys.stderr)
+        # Expand .blh includes and transpile
+        lines, _ = expand_blh_includes(filename, include_dirs)
+        compiler = Compiler(lines)
+        output = compiler.compile()
+        print(output, end='')
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"Error reading file: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-    
-    compiler = Compiler(lines)
-    output = compiler.compile()
-    
-    print(output, end='')
 
 
 if __name__ == '__main__':

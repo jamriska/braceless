@@ -1,0 +1,11 @@
+#include "braceless.blh"
+#include "regular.h"
+
+int main():
+    RegularStruct rs(5)
+    int x = regularFunction(rs.getValue())
+
+    BracelessClass bc(10)
+    int y = bc.process()
+
+    return x + y

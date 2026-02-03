@@ -1,0 +1,4 @@
+#pragma once
+
+int msvc_func():
+    return undefined_msvc_var

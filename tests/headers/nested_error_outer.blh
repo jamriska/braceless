@@ -1,0 +1,6 @@
+#pragma once
+
+#include "nested_error_inner.blh"
+
+int outer_func():
+    return inner_func() + 1

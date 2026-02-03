@@ -1,0 +1,3 @@
+#include "msvclib.blh"
+int main():
+    return msvc_lib_val

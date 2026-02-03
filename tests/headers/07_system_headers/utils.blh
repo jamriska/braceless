@@ -1,0 +1,26 @@
+#pragma once
+
+#include <vector>
+#include <string>
+
+inline int sumVector(const std::vector<int>& v):
+    int sum = 0
+    for (const auto& x : v):
+        sum += x
+    return sum
+
+inline int getLength(const std::string& s):
+    return static_cast<int>(s.length())
+
+class StringWrapper:
+private:
+    std::string data
+
+public:
+    StringWrapper(const std::string& s) : data(s) {}
+
+    int length() const:
+        return static_cast<int>(data.length())
+
+    const std::string& get() const:
+        return data

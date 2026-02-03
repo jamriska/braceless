@@ -1,0 +1,4 @@
+#include "error_test.blh"
+
+int main():
+    return add(1, 2)

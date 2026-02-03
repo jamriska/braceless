@@ -1,0 +1,4 @@
+#include "nested_error_outer.blh"
+
+int main():
+    return outer_func()

@@ -1,0 +1,16 @@
+// Base types header
+#pragma once
+
+struct Point:
+    int x
+    int y
+
+    Point() : x(0), y(0) {}
+    Point(int x, int y) : x(x), y(y) {}
+
+struct Size:
+    int width
+    int height
+
+    Size() : width(0), height(0) {}
+    Size(int w, int h) : width(w), height(h) {}

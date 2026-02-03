@@ -1,0 +1,4 @@
+#include "msvc_error.blh"
+
+int main():
+    return msvc_func()

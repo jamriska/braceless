@@ -1,0 +1,29 @@
+// Header with macros
+#pragma once
+
+#define MAX_VALUE 100
+#define MIN_VALUE 0
+
+#define CLAMP(x, lo, hi) ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
+
+#ifdef DEBUG
+#define LOG(msg) print_debug(msg)
+#else
+#define LOG(msg)
+#endif
+
+inline int clampValue(int x):
+    return CLAMP(x, MIN_VALUE, MAX_VALUE)
+
+class Bounded:
+private:
+    int value
+
+public:
+    Bounded() : value(MIN_VALUE) {}
+
+    void set(int v):
+        value = CLAMP(v, MIN_VALUE, MAX_VALUE)
+
+    int get() const:
+        return value

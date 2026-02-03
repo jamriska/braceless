@@ -1,0 +1,3 @@
+#include "verify.blh"
+int main():
+    return verify_val

@@ -1,0 +1,8 @@
+#pragma once
+
+#include "shared.blh"
+
+class ModuleB:
+public:
+    int compute(int x):
+        return sharedFunction(x) + SHARED_CONSTANT

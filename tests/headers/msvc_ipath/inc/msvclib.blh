@@ -1,0 +1,2 @@
+#pragma once
+int msvc_lib_val = 99

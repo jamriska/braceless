@@ -1,0 +1,4 @@
+#pragma once
+
+int inner_func():
+    return undefined_inner

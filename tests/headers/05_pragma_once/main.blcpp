@@ -1,0 +1,12 @@
+#include "module_a.blh"
+#include "module_b.blh"
+#include "shared.blh"
+
+int main():
+    ModuleA a
+    ModuleB b
+
+    int result = a.compute(10) + b.compute(10)
+    result += sharedFunction(5)
+
+    return result
