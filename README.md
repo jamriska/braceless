@@ -55,3 +55,18 @@ int main() {
 </td>
 </tr>
 </table>
+
+## Usage
+
+Use the wrapper that corresponds to your compiler:
+
+```bash
+# Clang
+blclang++ main.blcpp -o main
+
+# GCC
+blg++ main.blcpp -o main
+
+# MSVC
+blcl main.blcpp /Fe:main.exe
+```
