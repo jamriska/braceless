@@ -11,8 +11,432 @@ import re
 import subprocess
 import tempfile
 import shutil
-from typing import List, Tuple, Optional, Set, Dict, Callable
+from typing import List, Tuple, Optional, NamedTuple, Set, Dict, Callable
 from enum import Enum, auto
+from dataclasses import dataclass
+import clang.cindex
+
+
+class TokenKind(Enum):
+    """Token types returned by the tokenizer"""
+    KEYWORD = auto()
+    IDENTIFIER = auto()
+    LITERAL = auto()
+    PUNCTUATION = auto()
+    COMMENT = auto()
+    UNKNOWN = auto()
+
+
+@dataclass
+class Token:
+    """A single token from the source code"""
+    kind: TokenKind
+    spelling: str
+    line: int      # 1-based line number
+    column: int    # 1-based column number
+    
+    def __repr__(self):
+        return f"Token({self.kind.name}, {self.spelling!r}, L{self.line}:{self.column})"
+
+
+def _clang_kind_to_token_kind(clang_kind) -> TokenKind:
+    """Convert clang token kind to our TokenKind enum"""
+    kind_name = clang_kind.name
+    if kind_name == 'KEYWORD':
+        return TokenKind.KEYWORD
+    elif kind_name == 'IDENTIFIER':
+        return TokenKind.IDENTIFIER
+    elif kind_name == 'LITERAL':
+        return TokenKind.LITERAL
+    elif kind_name == 'PUNCTUATION':
+        return TokenKind.PUNCTUATION
+    elif kind_name == 'COMMENT':
+        return TokenKind.COMMENT
+    else:
+        return TokenKind.UNKNOWN
+
+
+def tokenize(source: str) -> List[Token]:
+    """
+    Tokenize braceless C++ source code.
+    
+    Args:
+        source: The source code string to tokenize
+        
+    Returns:
+        List of Token objects
+    """
+    # Create index and parse as C++ using unsaved_files
+    index = clang.cindex.Index.create()
+    
+    # Parse the source as a virtual .cpp file
+    tu = index.parse(
+        'source.cpp',
+        args=['-x', 'c++', '-std=c++17'],
+        unsaved_files=[('source.cpp', source)],
+        options=clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+    )
+    
+    # Extract tokens
+    tokens = []
+    for clang_token in tu.get_tokens(extent=tu.cursor.extent):
+        token = Token(
+            kind=_clang_kind_to_token_kind(clang_token.kind),
+            spelling=clang_token.spelling,
+            line=clang_token.location.line,
+            column=clang_token.location.column
+        )
+        tokens.append(token)
+    
+    return tokens
+
+
+def tokens_on_line(tokens: List[Token], line: int) -> List[Token]:
+    """Get all tokens on a specific line"""
+    return [t for t in tokens if t.line == line]
+
+
+def meaningful_tokens(tokens: List[Token]) -> List[Token]:
+    """Filter out comment tokens"""
+    return [t for t in tokens if t.kind != TokenKind.COMMENT]
+
+
+def paren_balance(tokens: List[Token]) -> int:
+    """
+    Calculate the balance of parentheses/brackets.
+    Positive = more opens than closes.
+    Note: Does NOT count braces {} as they're typically block delimiters, not expression grouping.
+    """
+    opens = sum(1 for t in tokens if t.kind == TokenKind.PUNCTUATION and t.spelling in '([')
+    closes = sum(1 for t in tokens if t.kind == TokenKind.PUNCTUATION and t.spelling in ')]')
+    return opens - closes
+
+
+def has_keyword(tokens: List[Token], keyword: str) -> bool:
+    """Check if tokens contain a specific keyword"""
+    return any(t.kind == TokenKind.KEYWORD and t.spelling == keyword for t in tokens)
+
+
+def first_keyword(tokens: List[Token]) -> Optional[Token]:
+    """Get the first keyword token, if any"""
+    for t in tokens:
+        if t.kind == TokenKind.KEYWORD:
+            return t
+    return None
+
+
+def has_lambda_pattern(tokens: List[Token]) -> bool:
+    """
+    Check if tokens contain a lambda pattern: [...](...) or [...]
+    
+    Distinguishes lambdas from array subscripts by checking if [ follows an identifier
+    (array subscript: arr[i]) vs starts fresh (lambda: [](...) or [&](...)).
+    """
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t.kind == TokenKind.PUNCTUATION and t.spelling == '[':
+            # Skip if this is array subscript ([ immediately after identifier/literal/])
+            if i > 0:
+                prev = tokens[i - 1]
+                if prev.kind in (TokenKind.IDENTIFIER, TokenKind.LITERAL) or prev.spelling in (']', ')'):
+                    # This is array subscript, not lambda
+                    i += 1
+                    continue
+            
+            # Find matching ]
+            bracket_depth = 1
+            j = i + 1
+            while j < len(tokens) and bracket_depth > 0:
+                if tokens[j].spelling == '[':
+                    bracket_depth += 1
+                elif tokens[j].spelling == ']':
+                    bracket_depth -= 1
+                j += 1
+            
+            if bracket_depth == 0:
+                # Found matching ] at position j-1
+                # Check if followed by ( for lambda with params
+                if j < len(tokens) and tokens[j].spelling == '(':
+                    return True
+                # Also consider [&], [=], [] as lambda captures even without ()
+                # These are lambdas if the capture is simple
+                capture_tokens = tokens[i+1:j-1]
+                if len(capture_tokens) <= 1:  # [], [&], [=], [x]
+                    return True
+        i += 1
+    return False
+
+
+class LogicalLine:
+    """
+    A logical line represents one or more physical lines that form a single statement.
+    
+    Continuations are merged automatically based on:
+    - Unmatched parentheses/brackets/braces
+    - Continuation operators at end of line
+    - Continuation starters at beginning of next line
+    """
+    
+    def __init__(self, start_line: int, raw_lines: List[str], tokens: List[Token]):
+        self.start_line = start_line  # 1-based line number
+        self.raw_lines = raw_lines    # Original source lines (for whitespace preservation)
+        self.tokens = tokens          # All tokens in this logical line
+        self._meaningful = None       # Cached meaningful tokens
+    
+    @property
+    def meaningful(self) -> List[Token]:
+        """Get non-comment tokens"""
+        if self._meaningful is None:
+            self._meaningful = [t for t in self.tokens if t.kind != TokenKind.COMMENT]
+        return self._meaningful
+    
+    @property
+    def indent(self) -> int:
+        """
+        Get the visual indent level of this logical line.
+        Computed from the first token's column, converting tabs to 4 spaces.
+        """
+        if not self.raw_lines:
+            return 0
+        
+        first_line = self.raw_lines[0]
+        indent = 0
+        for ch in first_line:
+            if ch == ' ':
+                indent += 1
+            elif ch == '\t':
+                indent += 4
+            else:
+                break
+        return indent
+    
+    @property
+    def leading_ws(self) -> str:
+        """Get the original leading whitespace from the first line"""
+        if not self.raw_lines:
+            return ''
+        first_line = self.raw_lines[0]
+        return first_line[:len(first_line) - len(first_line.lstrip(' \t'))]
+    
+    def is_blank(self) -> bool:
+        """Check if this is a blank line (no tokens)"""
+        return len(self.tokens) == 0
+    
+    def is_comment_only(self) -> bool:
+        """Check if this line contains only comments"""
+        return len(self.tokens) > 0 and len(self.meaningful) == 0
+    
+    def is_blank_or_comment(self) -> bool:
+        """Check if this is blank or comment-only"""
+        return self.is_blank() or self.is_comment_only()
+    
+    def ends_with_colon(self) -> bool:
+        """Check if the last meaningful token is a colon"""
+        if not self.meaningful:
+            return False
+        return self.meaningful[-1].spelling == ':'
+    
+    def ends_with_brace(self) -> bool:
+        """Check if the last meaningful token is an opening brace"""
+        if not self.meaningful:
+            return False
+        return self.meaningful[-1].spelling == '{'
+    
+    def is_block_start(self) -> bool:
+        """
+        Check if this line starts a braceless block (ends with : but not case/default/access).
+        """
+        if not self.ends_with_colon():
+            return False
+        
+        m = self.meaningful
+        if len(m) < 2:
+            return True  # Just ":" alone starts a block
+        
+        # Check for case/default (these keep the colon)
+        # case VALUE: or default:
+        prev = m[-2]
+        if prev.kind == TokenKind.KEYWORD and prev.spelling in ('default',):
+            return False
+        if prev.kind == TokenKind.LITERAL:
+            # Could be "case VALUE:" - check if 'case' appears before
+            if any(t.kind == TokenKind.KEYWORD and t.spelling == 'case' for t in m[:-2]):
+                return False
+        if prev.kind == TokenKind.KEYWORD and prev.spelling == 'case':
+            return False
+            
+        # Check for access specifiers (public/private/protected:)
+        if len(m) == 2 and prev.kind == TokenKind.KEYWORD and prev.spelling in ('public', 'private', 'protected'):
+            return False
+        
+        return True
+    
+    def is_access_specifier(self) -> bool:
+        """Check if this is an access specifier (public:/private:/protected:)"""
+        m = self.meaningful
+        if len(m) != 2:
+            return False
+        return (m[0].kind == TokenKind.KEYWORD and 
+                m[0].spelling in ('public', 'private', 'protected') and
+                m[1].spelling == ':')
+    
+    def is_case_or_default(self) -> bool:
+        """Check if this is a case or default label"""
+        if not self.ends_with_colon():
+            return False
+        m = self.meaningful
+        if not m:
+            return False
+        # default:
+        if m[0].kind == TokenKind.KEYWORD and m[0].spelling == 'default':
+            return True
+        # case VALUE:
+        if m[0].kind == TokenKind.KEYWORD and m[0].spelling == 'case':
+            return True
+        return False
+    
+    def __repr__(self):
+        return f"LogicalLine(L{self.start_line}, {len(self.raw_lines)} lines, {len(self.tokens)} tokens)"
+
+
+# Continuation operators - if line ends with these, it continues to next line
+# Note: '{' is NOT included because it opens blocks; continuation for initializers
+# is handled by paren_balance (unmatched '{')
+CONTINUATION_OPS = {'+', '-', '*', '/', '%', '&', '|', '^', '=', '<', '>', ',', '(', '[',
+                    '&&', '||', '==', '!=', '<=', '>=', '+=', '-=', '*=', '/=', '%=',
+                    '&=', '|=', '^=', '<<=', '>>=', '->', '.', '::'}
+
+# Continuation starters - if next line starts with these, previous line continues
+# Note: '}' is NOT included because it typically closes a block, not continues an expression
+CONTINUATION_STARTERS = {'.', ',', ')', ']', '?', ':'}
+
+
+def _is_continuation_end(tokens: List[Token]) -> bool:
+    """Check if tokens end with a continuation operator or unmatched parens"""
+    m = meaningful_tokens(tokens)
+    if not m:
+        return False
+    
+    # Preprocessor directives never continue (they end at newline)
+    if m[0].spelling == '#':
+        return False
+    
+    last = m[-1]
+    
+    # Check for ++ or -- (not continuation)
+    if last.spelling in ('++', '--'):
+        return False
+    
+    # Unmatched parens/brackets/braces means continuation
+    if paren_balance(tokens) > 0:
+        return True
+    
+    # Continuation operators
+    if last.kind == TokenKind.PUNCTUATION and last.spelling in CONTINUATION_OPS:
+        return True
+    
+    # Special case: 'for' loop without parens and without colon continues
+    # This handles multiline for conditions like:
+    #   for int i = 0;
+    #       i < 10;
+    #       i++:
+    # Note: We only do this for 'for' because it uses semicolons internally.
+    # If the for already has parens like 'for (int i=0; ...) expr', don't continue.
+    first = m[0]
+    if first.kind == TokenKind.KEYWORD and first.spelling == 'for':
+        # Check if there's a ( right after 'for' - if so, it's traditional syntax
+        if len(m) > 1 and m[1].spelling == '(':
+            # Traditional for with parens - don't continue
+            return False
+        # Check if line ends with : or { - if not, it continues
+        if last.spelling not in (':', '{'):
+            return True
+    
+    return False
+
+
+def _is_continuation_start(tokens: List[Token]) -> bool:
+    """Check if tokens start with a continuation character"""
+    m = meaningful_tokens(tokens)
+    if not m:
+        return False
+    
+    first = m[0]
+    if first.kind == TokenKind.PUNCTUATION and first.spelling in CONTINUATION_STARTERS:
+        return True
+    
+    # String literal at start of line continues previous string (string concatenation)
+    if first.kind == TokenKind.LITERAL and first.spelling.startswith('"'):
+        return True
+    
+    return False
+
+
+def group_logical_lines(source: str, tokens: List[Token]) -> List[LogicalLine]:
+    """
+    Group tokens into logical lines, merging continuations.
+    
+    Args:
+        source: Original source code (for preserving whitespace)
+        tokens: All tokens from the source
+        
+    Returns:
+        List of LogicalLine objects
+    """
+    lines = source.splitlines()
+    if not lines:
+        return []
+    
+    # Build a map of line number -> tokens on that line
+    line_tokens = {}
+    for t in tokens:
+        if t.line not in line_tokens:
+            line_tokens[t.line] = []
+        line_tokens[t.line].append(t)
+    
+    logical_lines = []
+    i = 0
+    
+    while i < len(lines):
+        line_num = i + 1  # 1-based
+        current_tokens = line_tokens.get(line_num, [])
+        raw_lines = [lines[i]]
+        all_tokens = list(current_tokens)
+        
+        # Check if this line continues to the next
+        cumulative_balance = paren_balance(all_tokens)
+        
+        while i + 1 < len(lines):
+            next_line_num = i + 2  # 1-based
+            next_tokens = line_tokens.get(next_line_num, [])
+            
+            # Continue if:
+            # 1. Cumulative paren balance > 0
+            # 2. Current line ends with continuation operator
+            # 3. Next line starts with continuation character
+            should_continue = False
+            
+            if cumulative_balance > 0:
+                should_continue = True
+            elif _is_continuation_end(all_tokens):
+                should_continue = True
+            elif _is_continuation_start(next_tokens):
+                should_continue = True
+            
+            if not should_continue:
+                break
+            
+            # Merge the next line
+            i += 1
+            raw_lines.append(lines[i])
+            all_tokens.extend(next_tokens)
+            cumulative_balance = paren_balance(all_tokens)
+        
+        logical_lines.append(LogicalLine(line_num, raw_lines, all_tokens))
+        i += 1
+    
+    return logical_lines
 
 
 class BlockType(Enum):
@@ -24,1159 +448,617 @@ class BlockType(Enum):
     SWITCH = auto()
     LAMBDA = auto()
     REGULAR_BRACE = auto()  # Regular C++ braces (don't output closing brace)
+    DO = auto()  # do-while loop (closing brace merges with while)
 
 
-class Compiler:
+class TokenCompiler:
+    """
+    Token-based Braceless C++ Compiler.
+    
+    Processes logical lines (statements) rather than physical lines,
+    eliminating the need for complex multiline state tracking.
+    """
+    
     def __init__(self, lines: List[str]):
+        # Join lines into source, preserving original lines for whitespace
+        self.source = '\n'.join(line.rstrip('\n\r') for line in lines)
         self.lines = [line.rstrip('\n\r') for line in lines]
-        self.output = []
-        self.current = 0
+        
+        # Tokenize the entire source
+        self.tokens = tokenize(self.source)
+        
+        # Group into logical lines
+        self.logical_lines = group_logical_lines(self.source, self.tokens)
+        
+        # State tracking
         self.indent_stack = [0]
         self.block_type_stack = [BlockType.NORMAL]
-        self.whitespace_stack = ['']  # Track actual whitespace for closing braces (parallel to indent_stack)
-        self.in_block_comment = False
-        self.continuation_indent = None
+        self.whitespace_stack = ['']  # Track whitespace for closing braces
+        
+        # Output
+        self.output = []
+        
+        # Pending blank lines (for proper placement around closing braces)
         self.pending_blank_lines = []
-        self.paren_depth = 0  # Track unclosed parentheses/brackets
-        # Multiline control structure tracking
-        self.control_keyword = None  # Tracks if/for/while/switch for multiline conditions
-        self.control_condition_lines = []  # Accumulated condition lines
-        self.control_start_indent = None  # Indent of the control keyword line
+        
+        # Flag for do-while handling
+        self._do_while_handled = False
     
     def compile(self) -> str:
         """Compile the braceless C++ to regular C++"""
-        while self.current < len(self.lines):
-            self._process_line()
-            self.current += 1
+        for ll in self.logical_lines:
+            self._process_logical_line(ll)
         
         # Close any remaining blocks
-        # Move pending blank lines to after closing braces
         saved_blank_lines = self.pending_blank_lines
         self.pending_blank_lines = []
         
         while len(self.indent_stack) > 1:
-            self.indent_stack.pop()  # Pop content indent
+            self.indent_stack.pop()
             block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else BlockType.NORMAL
             closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
-            self._output_closing_brace(block_type, closing_ws=closing_ws)
+            self._output_closing_brace(block_type, closing_ws)
         
         # Output any remaining blank lines
-        self.output.extend(saved_blank_lines)
+        if saved_blank_lines:
+            buffered = []
+            for item in saved_blank_lines:
+                if isinstance(item, tuple):
+                    raw = item[0]
+                    src_line = item[2] if len(item) >= 3 else 0
+                    buffered.append((raw, src_line))
+                else:
+                    buffered.append((item, 0))
+            self._emit_buffered_lines(buffered)
         
         return '\n'.join(self.output) + '\n'
     
-    def _process_line(self):
-        """Process a single line"""
-        line = self.lines[self.current]
+    def _buffer_blank_or_comment(self, raw_line: str, indent: int, source_line: int):
+        """Buffer a blank or comment line. Can be overridden for line tracking.
         
-        # Track if we start inside a block comment before updating state
-        started_in_comment = self.in_block_comment
+        Args:
+            raw_line: The raw line content
+            indent: The indent level
+            source_line: The source line number (1-based)
+        """
+        self.pending_blank_lines.append((raw_line, indent, source_line))
+    
+    def _process_logical_line(self, ll: LogicalLine):
+        """Process a single logical line"""
         
-        # Update block comment state
-        self._update_block_comment_state(line)
-        
-        # If we're inside a block comment (or started in one), output as-is
-        if started_in_comment or self.in_block_comment:
-            # Check if this line closes the block comment
-            if '*/' in line:
-                # This line closes the comment
-                self.output.append(line)
-                return
-            else:
-                # Still inside block comment
-                self.output.append(line)
-                return
-        
-        # Get indent level
-        indent = self._get_indent(line)
-        content = self._get_content(line)
-        # Get the leading whitespace for this line (used when opening blocks)
-        leading_ws = self._get_leading_ws(line)
-        
-        # Check if line is blank or comment-only
-        if not content or content.lstrip().startswith('//'):
-            # Dedent FIRST if this blank/comment is at a lower indent
-            # BUT only if the next non-blank/comment line is also at that indent or lower
-            # This prevents wrongly-indented comments from closing blocks
-            # ALSO check if next line is an access specifier - those don't cause dedents
-            if indent < self.indent_stack[-1]:
-                # Check next meaningful line (not blank/comment)
-                should_dedent = False
-                for i in range(self.current + 1, len(self.lines)):
-                    peek_line = self.lines[i]
-                    peek_indent = self._get_indent(peek_line)
-                    peek_content = self._get_content(peek_line)
-                    if peek_content and not peek_content.lstrip().startswith('//'):
-                        # Found a real code line
-                        # Check if it's an access specifier (public/private/protected:)
-                        is_access_specifier = False
-                        peek_colon_info = self._find_trailing_colon(peek_content)
-                        if peek_colon_info:
-                            peek_before_colon = peek_colon_info[0].strip()
-                            if peek_before_colon in ['public', 'private', 'protected']:
-                                is_access_specifier = True
-                        
-                        if peek_indent <= indent and not is_access_specifier:
-                            # Next code line is at same or lower indent - dedent now
-                            should_dedent = True
-                        break
-                
-                if should_dedent:
-                    while len(self.indent_stack) > 1 and self.indent_stack[-1] > indent:
-                        self.indent_stack.pop()
-                        block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else BlockType.NORMAL
-                        closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
-                        self._output_closing_brace(block_type, closing_ws)
-            
-            if not content:
-                # Blank line - check if it should be moved after closing braces
-                next_line = self._peek_next_line()
-                should_buffer = False
-                if next_line:
-                    next_indent = self._get_indent(next_line)
-                    # Buffer only if blank line's indent == dedented level
-                    # This means the blank line separates blocks at the same level
-                    if next_indent < self.indent_stack[-1] and indent == next_indent:
-                        should_buffer = True
-                
-                if should_buffer:
-                    # Buffer the blank line - it will be output after closing braces
-                    self.pending_blank_lines.append(line)
-                else:
-                    # Keep the blank line where it is
-                    self._flush_blank_lines()
-                    self.output.append(line)
-            else:
-                # Comment line - check if next line will cause dedent
-                next_line = self._peek_next_line()
-                should_buffer_comment = False
-                if next_line:
-                    next_indent = self._get_indent(next_line)
-                    # Buffer comment if next line will dedent
-                    if next_indent < self.indent_stack[-1]:
-                        should_buffer_comment = True
-                
-                if should_buffer_comment:
-                    # Buffer the comment to output after closing braces
-                    self.pending_blank_lines.append(line)
-                else:
-                    # Output comment now - flush pending blank lines first
-                    self._flush_blank_lines()
-                    self.output.append(line)
+        # Handle blank lines
+        if ll.is_blank():
+            # Buffer blank lines with their indent info for later placement
+            raw_line = ll.raw_lines[0] if ll.raw_lines else ''
+            self._buffer_blank_or_comment(raw_line, ll.indent, ll.start_line)
             return
         
-        # Check if we're in a multiline control structure condition
-        if self.control_keyword is not None:
-            # We're collecting a multiline control condition
-            # Check if this line has the colon
-            colon_info = self._find_trailing_colon(content)
-            if colon_info:
-                # Found the colon - this completes the condition
-                before_colon, after_colon = colon_info
-                # Accumulate this final line (preserving the full line with indent)
-                self.control_condition_lines.append(line[:line.rindex(before_colon) + len(before_colon)])
+        # Handle comment-only lines
+        if ll.is_comment_only():
+            # Buffer comments along with blank lines for proper placement during dedent
+            for i, raw_line in enumerate(ll.raw_lines):
+                self._buffer_blank_or_comment(raw_line, ll.indent, ll.start_line + i)
+            return
+        
+        # Handle dedenting (closing blocks)
+        if ll.indent < self.indent_stack[-1]:
+            # Check if this is an access specifier - don't close class/struct for those
+            if ll.is_access_specifier():
+                # Partition blank lines: those inside block vs those after
+                inside_blanks = []
+                after_blanks = []
+                for item in self.pending_blank_lines:
+                    raw, indent, src_line = item if len(item) == 3 else (item[0], item[1], 0)
+                    if indent < ll.indent:
+                        inside_blanks.append((raw, src_line))
+                    else:
+                        after_blanks.append((raw, src_line))
+                self.pending_blank_lines = []
                 
-                # Build the complete condition (all lines as-is)
-                # Insert opening paren on first line after keyword
-                first_line = self.control_condition_lines[0]
-                # Find where keyword ends
-                keyword_len = len(self.control_keyword)
-                keyword_end = first_line.index(self.control_keyword) + keyword_len
-                wrapped_first = first_line[:keyword_end] + ' (' + first_line[keyword_end:].lstrip()
-                
-                # Output all lines
-                self.output.append(wrapped_first)
-                for i in range(1, len(self.control_condition_lines)):
-                    self.output.append(self.control_condition_lines[i])
-                
-                # Add closing paren and opening brace on the last line
-                # Actually need to modify the last output line
-                self.output[-1] = self.output[-1] + ') {'
-                if after_colon.strip():
-                    self.output[-1] += after_colon
-                
-                # Determine block type
-                block_type = self._detect_block_type(self.control_keyword)
-                
-                # Check next line indent
-                next_line = self._peek_next_line()
-                if next_line:
-                    next_indent = self._get_indent(next_line)
-                    next_content = self._get_content(next_line)
-                    if next_content and not next_content.startswith('//') and next_indent > self.control_start_indent:
-                        self.indent_stack.append(next_indent)
-                        self.block_type_stack.append(block_type)
-                        # Use opener line's whitespace for closing brace
-                        opener_ws = self._get_leading_ws(self.control_condition_lines[0])
-                        self.whitespace_stack.append(opener_ws)
-                
-                # Reset multiline control state
-                self.control_keyword = None
-                self.control_condition_lines = []
-                self.control_start_indent = None
-                return
+                # Output inside blanks first
+                self._emit_buffered_lines(inside_blanks)
+                self._close_to_class_level()
+                self._emit_buffered_lines(after_blanks)
             else:
-                # No colon yet - accumulate this line and continue (preserve full line with indent)
-                self.control_condition_lines.append(line)
-                return
-        
-        # Check if this line starts a control structure without parentheses (multiline possibility)
-        # Must do this BEFORE continuation check
-        stripped = content.strip()
-        control_keywords = ['if', 'for', 'while', 'switch']
-        detected_keyword = None
-        for kw in control_keywords:
-            if stripped.startswith(kw + ' ') or stripped.startswith(kw + '\t'):
-                detected_keyword = kw
-                break
-        
-        # Also handle "else if"
-        if stripped.startswith('else if ') or stripped.startswith('else if\t'):
-            detected_keyword = 'else if'
-        
-        if detected_keyword:
-            # Special case: check if this is a while clause for do-while (no colon, no block)
-            if detected_keyword == 'while' and self._is_do_while():
-                # This is do-while's while clause - handle immediately, don't collect multiline
-                # (do-while condition doesn't open a block, just ends the do)
-                # Let the existing do-while handler process it
-                pass  # Fall through to existing logic
-            else:
-                # Check if line has colon (single-line control) or not (might be multiline)
-                colon_info = self._find_trailing_colon(content)
-                if not colon_info:
-                    # No colon on this line - might be multiline control structure
-                    # Check if condition starts with paren (traditional form) or not (braceless form)
-                    condition_start = len(detected_keyword)
-                    if detected_keyword == 'else if':
-                        condition_start = 7
-                    
-                    condition_part = stripped[condition_start:].lstrip()
-                    
-                    # If no opening paren, this is braceless form and might be multiline
-                    # BUT if it ends with {, it's a single-line control with optional parens + regular brace
-                    if not condition_part.startswith('('):
-                        # Check if this line has a regular brace (single-line with optional parens)
-                        if '{' in content:
-                            # Single-line control with optional parens but regular brace
-                            # Need to wrap condition and keep the brace
-                            # Extract condition (everything before the {)
-                            brace_pos = content.index('{')
-                            before_brace = content[:brace_pos].rstrip()
-                            after_brace = content[brace_pos:]  # { and everything after
+                # Normal dedent - close blocks
+                # Partition blank lines based on their indent vs next line's indent
+                # Blanks with indent < next_indent go BEFORE closing brace (inside block)
+                # Blanks with indent >= next_indent go AFTER closing brace
+                inside_blanks = []
+                after_blanks = []
+                for item in self.pending_blank_lines:
+                    raw, indent, src_line = item if len(item) == 3 else (item[0], item[1], 0)
+                    if indent < ll.indent:
+                        inside_blanks.append((raw, src_line))
+                    else:
+                        after_blanks.append((raw, src_line))
+                self.pending_blank_lines = []
+                
+                # Output inside blanks before closing brace
+                self._emit_buffered_lines(inside_blanks)
+                
+                # Check if this is a while clause for do-while
+                is_do_while_clause = False
+                m = ll.meaningful
+                if (m and m[0].kind == TokenKind.KEYWORD and m[0].spelling == 'while' and 
+                    not ll.ends_with_colon()):
+                    # Check if we're closing a DO block
+                    if len(self.block_type_stack) > 1 and self.block_type_stack[-1] == BlockType.DO:
+                        is_do_while_clause = True
+                
+                while len(self.indent_stack) > 1 and self.indent_stack[-1] > ll.indent:
+                    self.indent_stack.pop()
+                    block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else BlockType.NORMAL
+                    closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
+                    if block_type != BlockType.REGULAR_BRACE:
+                        if block_type == BlockType.DO and is_do_while_clause:
+                            # For do-while, output "} while (condition);" merged
+                            # Use original line text for proper spacing
+                            raw_line = ll.raw_lines[0] if ll.raw_lines else ''
+                            while_clause = raw_line.strip()
                             
-                            # Wrap the condition part
-                            wrapped = self._wrap_condition_if_needed(before_brace)
+                            # Check if condition already has parens
+                            # Extract condition after 'while'
+                            while_idx = while_clause.find('while')
+                            if while_idx >= 0:
+                                after_while = while_clause[while_idx + 5:].strip()
+                                # Remove trailing semicolon if present
+                                if after_while.endswith(';'):
+                                    after_while = after_while[:-1].strip()
+                                # Wrap in parens if not already
+                                if not (after_while.startswith('(') and after_while.endswith(')')):
+                                    while_clause = f"while ({after_while})"
+                                else:
+                                    while_clause = f"while {after_while}"
                             
-                            # Output with the brace, preserving original whitespace
-                            self.output.append(self._get_leading_ws(line) + wrapped + ' ' + after_brace)
-                            
-                            # Track this as a regular brace block
-                            next_line = self._peek_next_line()
-                            if next_line:
-                                next_indent = self._get_indent(next_line)
-                                next_content = self._get_content(next_line)
-                                if next_content and not next_content.startswith('//') and next_indent > indent:
-                                    self.indent_stack.append(next_indent)
-                                    self.block_type_stack.append(BlockType.REGULAR_BRACE)
-                                    self.whitespace_stack.append('')  # Not used for regular braces
-                            return
+                            self.output.append(f"{closing_ws}}} {while_clause};")
+                            # Mark that we've handled this line
+                            self._do_while_handled = True
                         else:
-                            # No opening paren and no brace - this is multiline
-                            # Start collecting multiline control condition
-                            self.control_keyword = detected_keyword
-                            self.control_condition_lines = [line]  # Store the full first line with keyword
-                            self.control_start_indent = indent
-                            return
-                    # If has opening paren, let normal continuation handling take over
+                            self._output_closing_brace(block_type, closing_ws)
+                
+                # Output after blanks after closing braces
+                self._emit_buffered_lines(after_blanks)
         
-        # Track if we're ending a continuation with a colon
-        ending_continuation_with_colon = False
+        # Check if we already handled this line as part of do-while
+        if hasattr(self, '_do_while_handled') and self._do_while_handled:
+            self._do_while_handled = False
+            return
         
-        # Check if this is a continuation line
-        if self.continuation_indent is not None:
-            # We're in a multiline continuation
-            if indent >= self.continuation_indent:
-                # Still continuing - but check if this line ends with colon (ends the continuation and starts a block)
-                colon_info = self._find_trailing_colon(content)
-                if colon_info:
-                    # This line ends the continuation and starts a block
-                    ending_continuation_with_colon = True
-                    self.continuation_indent = None
-                    # Fall through to handle the colon
-                else:
-                    # Check if this is the last continuation line
-                    # We need to check if cumulative paren/bracket depth is zero
-                    # Count net paren/bracket change (can be negative)
-                    open_count = content.count('(') + content.count('[')
-                    close_count = content.count(')') + content.count(']')
-                    self.paren_depth += open_count - close_count
-                    
-                    is_last_continuation = not self._is_continuation(content) and self.paren_depth <= 0
-                    
-                    # Check if ending with {} (inline function body in constructor initializer)
-                    stripped_content = content.rstrip()
-                    if (is_last_continuation and 
-                        stripped_content.endswith('{}') and 
-                        stripped_content.count('{') == stripped_content.count('}')):
-                        # Ends with {} - could be constructor initializer with inline body
-                        # Look back to find if this continuation started from a constructor/function
-                        # with an initializer list (has : and function signature)
-                        is_constructor_init = False
-                        
-                        for i in range(self.current - 1, -1, -1):
-                            prev_line = self.lines[i]
-                            prev_indent = self._get_indent(prev_line)
-                            prev_content = self._get_content(prev_line)
-                            if not prev_content or prev_content.lstrip().startswith('//'):
-                                continue
-                            # Check if less indented (start of statement)
-                            if prev_indent < indent:
-                                # Check for patterns:
-                                # 1. func() : init... (same line has : and ())
-                                # 2. func() followed by line starting with : (multi-line)
-                                if ':' in prev_content and '(' in prev_content:
-                                    is_constructor_init = True
-                                elif '(' in prev_content and ')' in prev_content:
-                                    # Function signature - check if CURRENT continuation chain has :
-                                    # Look for : in any line between start and current
-                                    for j in range(i, self.current + 1):
-                                        check_line = self.lines[j]
-                                        check_content = self._get_content(check_line)
-                                        if ':' in check_content and not check_content.lstrip().startswith('//'):
-                                            is_constructor_init = True
-                                            break
-                                break
-                        force_semicolon = not is_constructor_init
-                    else:
-                        # Force semicolon if ending continuation with } (but not {})
-                        force_semicolon = is_last_continuation and stripped_content.endswith('}') and not stripped_content.endswith('{}')
-                    
-                    self._output_with_semicolon(line, is_continuation=not is_last_continuation, force_semicolon=force_semicolon)
-                    if is_last_continuation:
-                        self.continuation_indent = None
-                        self.paren_depth = 0
-                    return
-            else:
-                # End of continuation
-                self.continuation_indent = None
-                # Fall through to process this line normally
+        # Check if this is else/catch that should merge with previous closing brace
+        is_else_catch = self._is_else_or_catch(ll)
         
-        # Handle dedenting (closing blocks) - but not when started in block comment
-        if not started_in_comment and indent < self.indent_stack[-1]:
-            # Check if current line is an access specifier - if so, don't close class/struct blocks
-            colon_info_check = self._find_trailing_colon(content)
-            if colon_info_check:
-                before_colon_check = colon_info_check[0]
-                stripped_check = before_colon_check.strip()
-                if stripped_check in ['public', 'private', 'protected']:
-                    # Check if ANY block in the stack is a class/struct
-                    has_class_or_struct = any(bt in [BlockType.CLASS, BlockType.STRUCT] 
-                                             for bt in self.block_type_stack)
-                    if has_class_or_struct:
-                        # Save any buffered blank lines
-                        saved_access_blank_lines = self.pending_blank_lines
-                        self.pending_blank_lines = []
-                        
-                        # Close any inner blocks (methods, etc.) but keep class/struct open
-                        # Find the class/struct level
-                        while len(self.indent_stack) > 1:
-                            if self.block_type_stack[-1] in [BlockType.CLASS, BlockType.STRUCT]:
-                                # Stop - we've reached the class/struct level
-                                break
-                            # Close inner block
-                            self.indent_stack.pop()
-                            block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else BlockType.NORMAL
-                            closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
-                            if block_type != BlockType.REGULAR_BRACE:
-                                self._output_closing_brace(block_type, closing_ws, content)
-                        
-                        # Output blank lines before the access specifier
-                        self.output.extend(saved_access_blank_lines)
-                        
-                        # Now output the access specifier
-                        self.output.append(line)
-                        return
-            
-            # Proceed with normal dedenting
-            # Move pending blank lines to after closing braces
-            saved_blank_lines = self.pending_blank_lines
-            self.pending_blank_lines = []
-            
-            while len(self.indent_stack) > 1 and self.indent_stack[-1] > indent:
-                self.indent_stack.pop()  # Pop the content indent
-                block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else BlockType.NORMAL
-                closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
-                # Only output closing brace for braceless blocks, not regular braces
-                if block_type != BlockType.REGULAR_BRACE:
-                    # Pass current line content to help determine if lambda needs semicolon
-                    self._output_closing_brace(block_type, closing_ws, content)
-            
-            # Store blank lines to output later (after potential else/catch merge)
-            self.pending_blank_lines = saved_blank_lines
-        
-        # Check if line is else/catch - if so, DON'T flush blank lines yet
-        might_be_else_or_catch = False
-        check_colon = self._find_trailing_colon(content)
-        if check_colon:
-            check_keyword = check_colon[0].strip().split()[0] if check_colon[0].strip() else ""
-            if check_keyword in ['else', 'catch']:
-                might_be_else_or_catch = True
-        
-        # Also check for regular brace else/catch
-        if content.rstrip().endswith('{'):
-            stripped_check = content.strip()
-            if stripped_check.startswith('else ') or stripped_check.startswith('catch '):
-                might_be_else_or_catch = True
-        
-        # Flush pending blank lines before processing a code line (unless it's else/catch)
-        if not might_be_else_or_catch:
+        # Flush pending blank lines (unless else/catch)
+        if not is_else_catch:
             self._flush_blank_lines()
         
-        # Check if line ends with a regular opening brace {
-        # We need to track the content indent for proper nesting
-        if content.rstrip().endswith('{') and not content.rstrip().endswith('{{'):
-            # Check if this line is 'else {' or 'catch {' (regular brace, not colon)
-            # If so, merge with previous closing brace
-            stripped_content = content.strip()
-            if (stripped_content.startswith('else ') or stripped_content.startswith('catch ')) and '{' in stripped_content:
-                if self.output and self.output[-1].strip() == '}':
-                    # Merge with previous closing brace
-                    self.output.pop()
-                    self.output.append(self._get_leading_ws(line) + '} ' + stripped_content)
-                    # Still need to track the indent for regular braces
-                    next_line = self._peek_next_line()
-                    if next_line:
-                        next_indent = self._get_indent(next_line)
-                        if next_indent > indent:
-                            self.indent_stack.append(next_indent)
-                            self.block_type_stack.append(BlockType.REGULAR_BRACE)
-                            self.whitespace_stack.append('')  # Not used for regular braces
-                    return
-            
-            # Regular brace - track the content indent
-            self.output.append(line)
-            next_line = self._peek_next_line()
-            if next_line:
-                next_indent = self._get_indent(next_line)
-                next_content = self._get_content(next_line)
-                if next_content and not next_content.startswith('//') and next_indent > indent:
-                    # Track this indent level for proper closing brace placement
-                    self.indent_stack.append(next_indent)
-                    self.block_type_stack.append(BlockType.REGULAR_BRACE)
-                    self.whitespace_stack.append('')  # Not used for regular braces
-            return
-        
-        # Check if line has } while (do-while on same line)
-        stripped_content = content.strip()
-        if stripped_content.startswith('} while ') or stripped_content.startswith('} while('):
-            # This is a do-while with } and while on the same line
-            if self._is_do_while():
-                # Extract the while part
-                while_part = stripped_content[2:].lstrip()  # Skip '} '
-                # Extract condition after 'while'
-                if while_part.startswith('while '):
-                    condition_part = while_part[6:].lstrip()  # 6 = len('while ')
-                elif while_part.startswith('while('):
-                    condition_part = while_part[5:]  # 5 = len('while')
-                else:
-                    condition_part = while_part
-                
-                # Remove trailing comment if present
-                comment_pos = self._find_line_comment(condition_part)
-                trailing_part = ""
-                if comment_pos is not None:
-                    # Keep whitespace before comment
-                    code_part = condition_part[:comment_pos].rstrip()
-                    spaces_before_comment = condition_part[len(code_part):comment_pos]
-                    trailing_part = spaces_before_comment + condition_part[comment_pos:]
-                    condition_part = code_part
-                else:
-                    condition_part = condition_part.rstrip()
-                
-                # Check if condition is already wrapped in parens
-                if not (condition_part.startswith('(') and condition_part.endswith(')')):
-                    # Wrap the condition
-                    wrapped_content = '} while (' + condition_part + ');'
-                else:
-                    wrapped_content = '} while ' + condition_part + ';'
-                
-                # Add trailing part back (with whitespace and comment)
-                if trailing_part:
-                    wrapped_content += trailing_part
-                
-                self.output.append(self._get_leading_ws(line) + wrapped_content)
-                return
-        
-        # Check if line is a regular closing brace
-        if content.strip() == '}':
-            # Check if we need to pop from stack
-            if len(self.indent_stack) > 1 and indent < self.indent_stack[-1]:
-                # Pop the tracked regular brace indent
-                self.indent_stack.pop()
-                if len(self.block_type_stack) > 1:
-                    self.block_type_stack.pop()
-                if len(self.whitespace_stack) > 1:
-                    self.whitespace_stack.pop()
-            self.output.append(line)
-            return
-        
-        # Check if line starts a block (ends with colon)
-        colon_info = self._find_trailing_colon(content)
-        
-        if colon_info:
-            # Line ends with colon
-            before_colon, after_colon = colon_info
-            
-            # Special cases that keep the colon
-            if self._should_keep_colon(before_colon):
-                # case, default - don't start a block
-                self.output.append(self._get_leading_ws(line) + before_colon + ':' + after_colon)
-                return
-            
-            # Determine block type
-            block_type = self._detect_block_type(before_colon)
-            
-            # Handle special keywords
-            stripped_before = before_colon.strip()
-            keyword = stripped_before.split()[0] if stripped_before else ""
-            
-            # Check if this is else/catch (including else if)
-            if keyword in ['else', 'catch']:
-                # Wrap condition if needed (for else if)
-                wrapped = self._wrap_condition_if_needed(stripped_before)
-                leading_ws = self._get_leading_ws(line)
-                
-                # These go on same line as closing brace
-                if self.output and self.output[-1].strip() == '}':
-                    self.output.pop()
-                    self.output.append(leading_ws + '} ' + wrapped + ' {' + after_colon)
-                    # NOW flush blank lines after the merge
-                    self._flush_blank_lines()
-                else:
-                    # Flush blank lines before outputting else/catch without merge
-                    self._flush_blank_lines()
-                    self.output.append(leading_ws + wrapped + ' {' + after_colon)
-                
-                # Start new block - need to track content indent, not the else line's indent
-                # Check next line's indent
-                next_line = self._peek_next_line()
-                if next_line:
-                    next_indent = self._get_indent(next_line)
-                    next_content = self._get_content(next_line)
-                    if next_content and not next_content.startswith('//') and next_indent > indent:
-                        self.indent_stack.append(next_indent)
-                        self.block_type_stack.append(block_type)
-                        self.whitespace_stack.append(leading_ws)  # Use opener's whitespace
-                else:
-                    # No next line or not indented - empty block
-                    self.indent_stack.append(indent + 4)
-                    self.block_type_stack.append(block_type)
-                    self.whitespace_stack.append(leading_ws)  # Use opener's whitespace
-                
-                self.continuation_indent = None
-                return
-            
-            # Regular block start - replace : with {
-            # Flush any pending blank lines first
+        # Handle access specifiers (public:/private:/protected:)
+        if ll.is_access_specifier():
             self._flush_blank_lines()
-            
-            # Check if we need to wrap condition in parentheses (optional parens feature)
-            before_colon_wrapped = self._wrap_condition_if_needed(before_colon)
-            
-            # Preserve original leading whitespace from input
-            output_line = self._get_leading_ws(line) + before_colon_wrapped + ' {' + after_colon
-            self.output.append(output_line)
-            
-            # Check if next line has increased indent
-            next_line = self._peek_next_line()
-            if next_line:
-                next_indent = self._get_indent(next_line)
-                next_content = self._get_content(next_line)
-                
-                # If this is a class/struct and next line is an access specifier, look further
-                if block_type in [BlockType.CLASS, BlockType.STRUCT] and next_content:
-                    # Check if next line is access specifier
-                    next_colon_info = self._find_trailing_colon(next_content)
-                    if next_colon_info:
-                        before_next_colon = next_colon_info[0].strip()
-                        if before_next_colon in ['public', 'private', 'protected']:
-                            # Look at the line after the access specifier
-                            for i in range(self.current + 2, len(self.lines)):
-                                peek_line = self.lines[i]
-                                peek_indent = self._get_indent(peek_line)
-                                peek_content = self._get_content(peek_line)
-                                if peek_content and not peek_content.startswith('//'):
-                                    next_indent = peek_indent
-                                    next_content = peek_content
-                                    break
-                
-                if next_content and not next_content.startswith('//'):
-                    # Determine the base indent to compare against
-                    # For continuation-ending colons, use the indent of the original line
-                    # Otherwise use current line's indent
-                    opener_ws = leading_ws  # Default to current line's whitespace
-                    if ending_continuation_with_colon:
-                        # The original line is where continuation_indent was set
-                        # That was the first line of this multi-line statement
-                        base_indent = 0  # Default
-                        # Find the line that started the continuation
-                        for i in range(self.current - 1, -1, -1):
-                            prev_line = self.lines[i]
-                            prev_indent = self._get_indent(prev_line)
-                            prev_content = self._get_content(prev_line)
-                            # Skip blanks and comments
-                            if not prev_content or prev_content.lstrip().startswith('//'):
-                                continue
-                            # This is a code line - check if it's the start
-                            if prev_indent < indent:
-                                # This line is less indented, so it's the start
-                                base_indent = prev_indent
-                                opener_ws = self._get_leading_ws(prev_line)  # Use original opener's whitespace
-                                break
-                    else:
-                        base_indent = indent
-                    
-                    # Check if next line is indented relative to the base
-                    if next_indent > base_indent:
-                        # Next line is part of the block
-                        self.indent_stack.append(next_indent)
-                        self.block_type_stack.append(block_type)
-                        self.whitespace_stack.append(opener_ws)  # Use opener's whitespace
-                    elif next_content.strip() == 'pass':
-                        # Empty block
-                        self.indent_stack.append(base_indent + 4)
-                        self.block_type_stack.append(block_type)
-                        self.whitespace_stack.append(opener_ws)  # Use opener's whitespace
-            
-            # Clear continuation since we've started a block
-            self.continuation_indent = None
+            self._emit_raw_lines(ll)
             return
         
-        # Check if this is part of a do-while closing
-        if self._is_while_clause_for_do(content):
-            # This is "while (condition)" after a do block
-            # The dedent logic already closed the do block and popped the stack
-            # Need to wrap condition in parens if not already wrapped
-            stripped_content = content.strip()
-            
-            # Extract the condition after 'while'
-            if stripped_content.startswith('while '):
-                condition_part = stripped_content[6:].lstrip()  # 6 = len('while ')
-                
-                # Remove trailing comment to check parens
-                comment_pos = self._find_line_comment(condition_part)
-                trailing_part = ""
-                if comment_pos is not None:
-                    code_part = condition_part[:comment_pos].rstrip()
-                    spaces_before_comment = condition_part[len(code_part):comment_pos]
-                    trailing_part = spaces_before_comment + condition_part[comment_pos:]
-                    condition_part = code_part
-                else:
-                    condition_part = condition_part.rstrip()
-                
-                # Check if already has parens wrapping entire condition
-                if not (condition_part.startswith('(') and condition_part.endswith(')')):
-                    # Wrap the condition
-                    wrapped_content = 'while (' + condition_part + ');'
-                else:
-                    wrapped_content = 'while ' + condition_part + ';'
-                
-                # Add trailing part back
-                if trailing_part:
-                    wrapped_content += trailing_part
-            else:
-                wrapped_content = stripped_content + ';'
-            
-            if self.output and self.output[-1].strip() == '}':
-                self.output.pop()
-                self.output.append(self._get_leading_ws(line) + '} ' + wrapped_content)
-            else:
-                self.output.append(self._get_leading_ws(line) + wrapped_content)
+        # Handle case/default labels
+        if ll.is_case_or_default():
+            self._emit_raw_lines(ll)
             return
         
-        # Regular statement - check if it needs semicolon
-        # Check if this line ends with continuation character
-        is_continuing = self._is_continuation(content)
-        self._output_with_semicolon(line, is_continuation=is_continuing)
+        # Handle regular closing brace
+        if self._is_closing_brace(ll):
+            self._handle_closing_brace(ll)
+            return
         
-        if is_continuing:
-            self.continuation_indent = indent
-            # Initialize paren depth for this continuation (can be negative)
-            open_count = content.count('(') + content.count('[')
-            close_count = content.count(')') + content.count(']')
-            self.paren_depth = open_count - close_count
+        # Handle line ending with opening brace (regular C++ brace)
+        if ll.ends_with_brace():
+            self._handle_regular_brace(ll)
+            return
+        
+        # Handle block start (ends with colon)
+        if ll.is_block_start():
+            self._handle_block_start(ll)
+            return
+        
+        # Regular statement - add semicolon if needed
+        self._handle_statement(ll)
     
-    def _output_with_semicolon(self, line: str, is_continuation=False, force_semicolon=False):
-        """Output a line, adding semicolon if needed"""
-        content = self._get_content(line)
-        # Preserve the original leading whitespace (tabs and spaces)
-        leading_ws = line[:len(line) - len(line.lstrip(' \t'))]
-        
-        if not content.strip():
-            self.output.append(line)
-            return
-        
-        # Check if line is 'pass'
-        if content.strip() == 'pass':
-            return
-        
-        # Check if we're inside an enum - enum items don't need semicolons
-        if self.block_type_stack and self.block_type_stack[-1] == BlockType.ENUM:
-            # Inside an enum, items don't need semicolons
-            self.output.append(line)
-            return
-        
-        # Check if needs semicolon
-        if (not force_semicolon and not self._needs_semicolon(content)) or is_continuation:
-            self.output.append(line)
-            return
-        
-        # Add semicolon
-        # Find where to add it (before comments, preserving trailing whitespace)
-        
-        # Find comment start in the original content
-        comment_pos = self._find_line_comment(content)
-        
-        if comment_pos is not None:
-            # Preserve spacing - find where code ends (last non-space before comment)
-            before_comment_with_spaces = content[:comment_pos]
-            code_part = before_comment_with_spaces.rstrip()
-            spaces_before_comment = before_comment_with_spaces[len(code_part):]
-            comment_part = content[comment_pos:]  # Preserve trailing whitespace in comment
-            result = leading_ws + code_part + ';' + spaces_before_comment + comment_part
-        else:
-            # No comment - preserve trailing whitespace from input
-            code_part = content.rstrip()
-            trailing_spaces = content[len(code_part):]
-            result = leading_ws + code_part + ';' + trailing_spaces
-        
-        self.output.append(result)
+    def _is_else_or_catch(self, ll: LogicalLine) -> bool:
+        """Check if this line is an else or catch clause"""
+        m = ll.meaningful
+        if not m:
+            return False
+        first = m[0]
+        return first.kind == TokenKind.KEYWORD and first.spelling in ('else', 'catch')
     
-    def _output_closing_brace(self, block_type: BlockType, closing_ws: str = "", current_line_content: str = ""):
-        """Output a closing brace with optional semicolon"""
-        # Check if block needs semicolon
-        needs_semicolon = block_type in [BlockType.CLASS, BlockType.STRUCT, BlockType.ENUM, BlockType.UNION, BlockType.LAMBDA]
-        
-        # For lambdas, check if current or next line is a continuation
-        if block_type == BlockType.LAMBDA:
-            # Check current line (the line that triggered the dedent)
-            current_stripped = current_line_content.lstrip()
-            if current_stripped.startswith('),') or current_stripped.startswith(')'):
-                needs_semicolon = False
-            else:
-                # Check next line
-                next_line = self._peek_next_line()
-                if next_line:
-                    next_content = next_line.lstrip()
-                    # If next line starts with continuation markers, lambda is part of larger expression
-                    if next_content and next_content[0] in '),;':
-                        needs_semicolon = False
-        
-        closing = closing_ws + '}'
-        if needs_semicolon:
-            closing += ';'
-        
-        self.output.append(closing)
+    def _is_closing_brace(self, ll: LogicalLine) -> bool:
+        """Check if this is just a closing brace"""
+        m = ll.meaningful
+        return len(m) == 1 and m[0].spelling == '}'
     
-    def _get_indent(self, line: str) -> int:
-        """Calculate visual indentation level (tabs count as 4 spaces)"""
-        indent = 0
-        for ch in line:
-            if ch == ' ':
-                indent += 1
-            elif ch == '\t':
-                indent += 4
-            else:
+    def _close_to_class_level(self):
+        """Close inner blocks but keep class/struct open (for access specifiers)"""
+        while len(self.indent_stack) > 1:
+            if self.block_type_stack[-1] in (BlockType.CLASS, BlockType.STRUCT):
                 break
-        return indent
+            self.indent_stack.pop()
+            block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else BlockType.NORMAL
+            closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
+            if block_type != BlockType.REGULAR_BRACE:
+                self._output_closing_brace(block_type, closing_ws)
     
-    def _get_content(self, line: str) -> str:
-        """Get the content of a line (everything after leading whitespace)"""
-        return line.lstrip(' \t')
-    
-    def _get_leading_ws(self, line: str) -> str:
-        """Get the original leading whitespace (tabs and spaces) from a line"""
-        return line[:len(line) - len(line.lstrip(' \t'))]
-    
-    def _flush_blank_lines(self):
-        """Output any pending blank lines"""
-        if self.pending_blank_lines:
-            self.output.extend(self.pending_blank_lines)
-            self.pending_blank_lines = []
-    
-    def _update_block_comment_state(self, line: str):
-        """Update whether we're inside a block comment"""
-        # Scan for /* and */
-        i = 0
-        while i < len(line):
-            if not self.in_block_comment and i + 1 < len(line) and line[i:i+2] == '/*':
-                self.in_block_comment = True
-                i += 2
-            elif self.in_block_comment and i + 1 < len(line) and line[i:i+2] == '*/':
-                self.in_block_comment = False
-                i += 2
-            else:
-                i += 1
-    
-    def _find_trailing_colon(self, content: str) -> Optional[Tuple[str, str]]:
-        """Find if line ends with colon outside strings/comments"""
-        if not content:
-            return None
+    def _detect_block_type(self, ll: LogicalLine) -> BlockType:
+        """Detect what type of block is starting based on tokens"""
+        keywords = {t.spelling for t in ll.tokens if t.kind == TokenKind.KEYWORD}
         
-        in_string = False
-        string_delim = None
-        last_colon = None
-        i = 0
-        
-        while i < len(content):
-            ch = content[i]
-            
-            # Escape sequences
-            if i > 0 and content[i-1] == '\\':
-                i += 1
-                continue
-            
-            # Line comments
-            if not in_string and i + 1 < len(content) and content[i:i+2] == '//':
-                break
-            
-            # Strings
-            if ch == '"' and not in_string:
-                in_string = True
-                string_delim = '"'
-            elif ch == '"' and in_string and string_delim == '"':
-                in_string = False
-            elif ch == "'" and not in_string:
-                in_string = True
-                string_delim = "'"
-            elif ch == "'" and in_string and string_delim == "'":
-                in_string = False
-            elif not in_string and ch == ':':
-                last_colon = i
-            
-            i += 1
-        
-        if last_colon is not None:
-            after = content[last_colon + 1:]
-            # Check what comes after the colon
-            after_stripped = after.strip()
-            # Only treat as block-starting colon if there's nothing after except whitespace/comments
-            if not after_stripped or after_stripped.startswith('//'):
-                return (content[:last_colon].rstrip(), after)
-        
-        return None
-    
-    def _should_keep_colon(self, before_colon: str) -> bool:
-        """Check if colon should be kept (case, default, etc.)"""
-        stripped = before_colon.strip()
-        return (stripped.startswith('case ') or 
-                stripped == 'default' or
-                stripped in ['public', 'private', 'protected'])
-    
-    def _wrap_condition_if_needed(self, before_colon: str) -> str:
-        """Wrap condition in parentheses if it's a control structure without parens (optional parens feature)"""
-        stripped = before_colon.strip()
-        
-        # Control keywords that need condition wrapping
-        control_keywords = ['if', 'for', 'while', 'switch']
-        
-        # Check if line starts with a control keyword
-        keyword = None
-        for kw in control_keywords:
-            if stripped.startswith(kw + ' ') or stripped.startswith(kw + '\t'):
-                keyword = kw
-                break
-        
-        # Also handle "else if"
-        if stripped.startswith('else if ') or stripped.startswith('else if\t'):
-            keyword = 'else if'
-        
-        if not keyword:
-            # Not a control structure, return as-is
-            return before_colon
-        
-        # Extract condition part after keyword
-        condition_start = len(keyword)
-        if stripped.startswith('else if'):
-            condition_start = 7  # len('else if')
-        
-        condition_part = stripped[condition_start:].lstrip()
-        
-        # Check if condition is already wrapped in parentheses
-        if condition_part.startswith('('):
-            # Already has parentheses - check if they wrap the entire condition
-            # Find matching closing paren
-            paren_depth = 0
-            for i, ch in enumerate(condition_part):
-                if ch == '(':
-                    paren_depth += 1
-                elif ch == ')':
-                    paren_depth -= 1
-                    if paren_depth == 0:
-                        # Found matching paren
-                        if i == len(condition_part) - 1:
-                            # Parens wrap entire condition, return as-is
-                            return before_colon
-                        # Parens don't wrap everything, fall through to wrap
-                        break
-        
-        # No parens or partial parens - wrap the condition
-        # Preserve leading whitespace from original
-        leading_ws = before_colon[:len(before_colon) - len(before_colon.lstrip())]
-        
-        # Build output with wrapped condition
-        if keyword == 'else if':
-            result = leading_ws + 'else if (' + condition_part + ')'
-        else:
-            result = leading_ws + keyword + ' (' + condition_part + ')'
-        
-        return result
-    
-    def _detect_block_type(self, before_colon: str) -> BlockType:
-        """Detect what type of block is starting"""
-        stripped = before_colon.strip()
+        # Check for do (do-while loop)
+        m = ll.meaningful
+        if m and m[0].kind == TokenKind.KEYWORD and m[0].spelling == 'do':
+            return BlockType.DO
         
         # Check for enum first (before class) to handle "enum class"
-        if stripped.startswith('enum ') or ' enum ' in stripped:
+        if 'enum' in keywords:
             return BlockType.ENUM
-        if stripped.startswith('class ') or ' class ' in stripped:
+        if 'class' in keywords:
             return BlockType.CLASS
-        if stripped.startswith('struct ') or ' struct ' in stripped:
+        if 'struct' in keywords:
             return BlockType.STRUCT
-        if stripped.startswith('union ') or ' union ' in stripped:
+        if 'union' in keywords:
             return BlockType.UNION
-        if stripped.startswith('switch '):
+        if 'switch' in keywords:
             return BlockType.SWITCH
-        # Lambda detection: look for [](...) or [&](...) or [=](...) pattern
-        if '[]' in stripped or '[&]' in stripped or '[=]' in stripped or (stripped.startswith('[') and '](' in stripped):
+        
+        # Lambda detection
+        if has_lambda_pattern(ll.tokens):
             return BlockType.LAMBDA
         
         return BlockType.NORMAL
     
-    def _peek_next_line(self) -> Optional[str]:
-        """Peek at the next non-blank, non-comment line"""
-        for i in range(self.current + 1, len(self.lines)):
-            line = self.lines[i]
-            content = line.lstrip()
-            if content and not content.startswith('//'):
-                return line
-        return None
-    
-    def _is_do_while(self) -> bool:
-        """Check if we're currently in a do-while loop"""
-        for i in range(len(self.output) - 1, -1, -1):
-            line = self.output[i].strip()
-            if line.startswith('do {'):
-                return True
-            if line.endswith('{') and 'do' not in line:
-                return False
-        return False
-    
-    def _is_while_clause_for_do(self, content: str) -> bool:
-        """Check if this is the while clause of a do-while loop"""
-        stripped = content.strip()
-        if stripped.startswith('while ') or stripped.startswith('while('):
-            return self._is_do_while()
-        return False
-    
-    def _needs_semicolon(self, content: str) -> bool:
-        """Check if line needs a semicolon"""
-        stripped = content.rstrip()
+    def _wrap_condition_if_needed(self, ll: LogicalLine) -> str:
+        """
+        Wrap condition in parentheses if it's a control structure without parens.
+        Returns the transformed line content (without the trailing colon, with parens).
+        Preserves original whitespace from source and comments.
+        """
+        m = ll.meaningful
+        if not m:
+            return ll.leading_ws
         
-        # Remove line comments
-        comment_pos = self._find_line_comment(stripped)
-        if comment_pos is not None:
-            stripped = stripped[:comment_pos].rstrip()
+        # Check if first token is a control keyword
+        first = m[0]
+        control_keywords = {'if', 'for', 'while', 'switch'}
         
-        if not stripped:
+        keyword = None
+        keyword_end_idx = 0
+        
+        if first.kind == TokenKind.KEYWORD:
+            if first.spelling in control_keywords:
+                keyword = first.spelling
+                keyword_end_idx = 1
+            elif first.spelling == 'else' and len(m) > 1:
+                second = m[1]
+                if second.kind == TokenKind.KEYWORD and second.spelling == 'if':
+                    keyword = 'else if'
+                    keyword_end_idx = 2
+        
+        if not keyword:
+            # Not a control structure - use original line without colon
+            return self._strip_trailing_colon(ll)
+        
+        # Check if condition is already wrapped in parentheses
+        if keyword_end_idx < len(m) and m[keyword_end_idx].spelling == '(':
+            # Already has parens - just strip the colon
+            return self._strip_trailing_colon(ll)
+        
+        # Need to wrap the condition in parentheses
+        colon_token = m[-1]  # Should be ':'
+        colon_line = colon_token.line  # 1-based line number
+        
+        # Handle multiline case
+        if len(ll.raw_lines) > 1 or colon_line > ll.start_line:
+            # Multiline condition - join all lines and extract condition
+            # Build full content from raw lines
+            all_content = '\n'.join(ll.raw_lines)
+            
+            # Find keyword position in first line
+            first_line = ll.raw_lines[0]
+            keyword_token = m[keyword_end_idx - 1]
+            keyword_end_col = keyword_token.column + len(keyword_token.spelling) - 1
+            
+            # Find colon position in last line
+            colon_line_idx = colon_token.line - ll.start_line  # 0-based index
+            colon_col = colon_token.column - 1  # 0-based
+            
+            # Extract content after keyword from first line
+            first_after_keyword = first_line[keyword_end_col:]
+            
+            # Extract content before colon from last line
+            if colon_line_idx < len(ll.raw_lines):
+                last_line = ll.raw_lines[colon_line_idx]
+                last_before_colon = last_line[:colon_col]
+            else:
+                last_before_colon = ''
+            
+            # Build condition: first line content + middle lines + last line content
+            if colon_line_idx == 0:
+                # Single line (shouldn't happen here, but handle it)
+                condition = first_line[keyword_end_col:colon_col].strip()
+            else:
+                # Preserve original whitespace within lines
+                parts = [first_after_keyword]
+                for i in range(1, colon_line_idx):
+                    parts.append(ll.raw_lines[i])
+                parts.append(last_before_colon)
+                condition = '\n'.join(parts)
+            
+            # For multiline, output with newlines preserved but add parens
+            # Strip leading whitespace from condition but preserve internal whitespace
+            result = f"{ll.leading_ws}{keyword} ({condition.lstrip()})"
+            return result
+        
+        # Single line case
+        first_line = ll.raw_lines[0] if ll.raw_lines else ''
+        
+        # Find keyword end position in source
+        keyword_token = m[keyword_end_idx - 1]
+        keyword_end_col = keyword_token.column + len(keyword_token.spelling) - 1
+        
+        # Find colon position
+        colon_col = colon_token.column - 1  # 0-based
+        
+        # Extract condition from source (between keyword and colon)
+        condition = first_line[keyword_end_col:colon_col].strip()
+        
+        # Get comment text after colon (if any)
+        comment_text = ''
+        after_colon = first_line[colon_col + 1:] if colon_col + 1 < len(first_line) else ''
+        if after_colon.strip():
+            comment_text = after_colon
+        
+        result = f"{ll.leading_ws}{keyword} ({condition})"
+        if comment_text:
+            result += comment_text
+        return result
+    
+    def _strip_trailing_colon(self, ll: LogicalLine) -> str:
+        """Remove the trailing colon from the logical line, preserving whitespace and comments"""
+        # Find the colon token and get its position
+        m = ll.meaningful
+        if not m or m[-1].spelling != ':':
+            return '\n'.join(ll.raw_lines)
+        
+        colon_token = m[-1]
+        colon_line = colon_token.line - ll.start_line  # 0-based index into raw_lines
+        colon_col = colon_token.column - 1  # 0-based column
+        
+        if len(ll.raw_lines) == 1:
+            line = ll.raw_lines[0]
+            # Remove colon but keep everything after it (comments)
+            before_colon = line[:colon_col]
+            after_colon = line[colon_col + 1:]  # Skip the colon
+            return before_colon.rstrip() + after_colon
+        else:
+            # Multiline - strip colon from the line containing it
+            lines = list(ll.raw_lines)
+            if colon_line < len(lines):
+                line = lines[colon_line]
+                before_colon = line[:colon_col]
+                after_colon = line[colon_col + 1:]
+                lines[colon_line] = before_colon.rstrip() + after_colon
+            return '\n'.join(lines)
+    
+    def _handle_block_start(self, ll: LogicalLine):
+        """Handle a line that starts a braceless block (ends with :)"""
+        block_type = self._detect_block_type(ll)
+        
+        # Get transformed content (colon removed, condition wrapped if needed)
+        content = self._wrap_condition_if_needed(ll)
+        
+        # Check if there's a comment token on the first line
+        comment_part = ''
+        before_comment = content
+        comment_tokens = [t for t in ll.tokens if t.kind == TokenKind.COMMENT and t.line == ll.start_line]
+        if comment_tokens:
+            # There's a comment - check if content already contains it
+            # by seeing if the comment text appears in content
+            first_comment = comment_tokens[0]
+            raw_line = ll.raw_lines[0] if ll.raw_lines else ''
+            comment_col = first_comment.column - 1
+            comment_text = raw_line[comment_col:]
+            
+            if comment_text in content:
+                # Content already has the comment - extract it
+                idx = content.find(comment_text)
+                before_comment = content[:idx].rstrip()
+                comment_part = ' ' + comment_text
+            else:
+                # Content doesn't have the comment - add it
+                comment_part = ' ' + comment_text
+        
+        # Check for else/catch - merge with previous closing brace
+        if self._is_else_or_catch(ll):
+            if self.output and self.output[-1].strip() == '}':
+                self.output.pop()
+                self.output.append(f"{ll.leading_ws}}} {before_comment.lstrip()} {{{comment_part}")
+                self._flush_blank_lines()
+            else:
+                self._flush_blank_lines()
+                self.output.append(f"{before_comment} {{{comment_part}")
+        else:
+            # Regular block start
+            self.output.append(f"{before_comment} {{{comment_part}")
+        
+        # Track the new block
+        self._push_block(ll, block_type)
+    
+    def _handle_regular_brace(self, ll: LogicalLine):
+        """Handle a line that ends with opening brace (regular C++ syntax)"""
+        # Check for else/catch with regular brace
+        if self._is_else_or_catch(ll):
+            content = ' '.join(t.spelling for t in ll.meaningful)
+            if self.output and self.output[-1].strip() == '}':
+                self.output.pop()
+                self.output.append(f"{ll.leading_ws}}} {content}")
+            else:
+                self.output.append(f"{ll.leading_ws}{content}")
+        else:
+            # Output lines as-is
+            self._emit_raw_lines(ll)
+        
+        # Track the regular brace block
+        self._push_block(ll, BlockType.REGULAR_BRACE)
+    
+    def _handle_closing_brace(self, ll: LogicalLine):
+        """Handle a standalone closing brace"""
+        # Pop from stack if appropriate
+        if len(self.indent_stack) > 1 and ll.indent < self.indent_stack[-1]:
+            self.indent_stack.pop()
+            if len(self.block_type_stack) > 1:
+                self.block_type_stack.pop()
+            if len(self.whitespace_stack) > 1:
+                self.whitespace_stack.pop()
+        
+        self._emit_raw_lines(ll)
+    
+    def _handle_statement(self, ll: LogicalLine):
+        """Handle a regular statement (add semicolon if needed)"""
+        # Check for 'pass' statement - it's a no-op placeholder
+        m = ll.meaningful
+        if len(m) == 1 and m[0].kind == TokenKind.IDENTIFIER and m[0].spelling == 'pass':
+            # Skip pass statements
+            return
+        
+        # Check if inside enum (no semicolons needed)
+        if self.block_type_stack and self.block_type_stack[-1] == BlockType.ENUM:
+            self._emit_raw_lines(ll)
+            return
+        
+        # Check if needs semicolon
+        if self._needs_semicolon(ll):
+            # Add semicolon to the last line
+            modified_lines = list(ll.raw_lines)
+            if modified_lines:
+                last_line_idx = len(modified_lines) - 1
+                last_line = modified_lines[last_line_idx]
+                last_physical_line = ll.start_line + last_line_idx
+                
+                # Find comment on the last line
+                comment_tokens = [t for t in ll.tokens if t.kind == TokenKind.COMMENT and t.line == last_physical_line]
+                if comment_tokens:
+                    # Has comment - insert semicolon before it
+                    comment_start = comment_tokens[0].column - 1
+                    before_comment = last_line[:comment_start].rstrip()
+                    comment_part = last_line[comment_start:]
+                    modified_lines[last_line_idx] = before_comment + '; ' + comment_part.lstrip()
+                else:
+                    modified_lines[last_line_idx] = last_line.rstrip() + ';'
+            self._emit_raw_lines(ll, modified_lines)
+        else:
+            self._emit_raw_lines(ll)
+    
+    def _needs_semicolon(self, ll: LogicalLine) -> bool:
+        """Check if a statement needs a semicolon"""
+        m = ll.meaningful
+        if not m:
             return False
         
-        # Check if line starts with continuation from previous line
-        first_non_space = stripped.lstrip()
-        if first_non_space and first_non_space[0] == ',':
-            # Line starts with comma - continuation from previous, no semicolon
-            return False
-        # Line starting with . is a method chain - check if there's more chaining after
-        if first_non_space and first_non_space[0] == '.':
-            # Check if next line also starts with . (more chaining)
-            next_line = self._peek_next_line()
-            if next_line:
-                next_content = next_line.lstrip()
-                if next_content.startswith('.'):
-                    # More chaining continues, no semicolon
-                    return False
-            # Last line in chain or no more chaining - needs semicolon (will be determined by other rules)
-            # Fall through to other checks
-        # Line starting with ) followed by comma is a continuation
-        if first_non_space.startswith('),'):
-            # ), - part of multi-line call, no semicolon
-            return False
-        
-        last_char = stripped[-1]
+        last = m[-1]
         
         # Already has semicolon
-        if last_char in ';':
+        if last.spelling == ';':
             return False
         
         # Opening brace - no semicolon
-        if last_char == '{':
+        if last.spelling == '{':
             return False
         
-        # Closing brace - check context
-        if last_char == '}':
-            # Check if it looks like an initializer (has = { pattern)
-            # Look for assignment followed by opening brace
-            if '= {' in stripped or '={' in stripped:
-                # Likely an initializer like "int arr[] = {1, 2, 3}"
-                return True
-            # Check for lambda (assignment, return, or statement): has lambda pattern [](...) { }
-            if '[' in stripped and ']' in stripped and '(' in stripped and '{' in stripped:
-                # Count braces to see if this is a complete lambda expression (not just opening a lambda block)
-                if stripped.count('{') == stripped.count('}'):
-                    # Complete lambda expression - check if it needs semicolon
-                    # Needs semicolon if: assignment, return, or statement
-                    if '=' in stripped or stripped.lstrip().startswith('return'):
-                        return True
-            # Check if line starts with : (constructor initializer list) and has inline body
-            if first_non_space.startswith(':') and '{' in stripped and stripped.count('{') == stripped.count('}'):
-                # Constructor initializer list with inline body like : member(value) {} - no semicolon
-                return False
-            # Otherwise no semicolon needed (block closing or inline block)
+        # Closing brace - check for initializer pattern
+        if last.spelling == '}':
+            # Check for = { ... } pattern (initializer)
+            # Must have = directly followed by { (not separated by other things like )
+            for i, t in enumerate(m):
+                if t.spelling == '=' and i + 1 < len(m) and m[i + 1].spelling == '{':
+                    return True
+            # Lambda with assignment (= [...] pattern)
+            if has_lambda_pattern(m):
+                has_equals = any(t.spelling == '=' for t in m)
+                if has_equals:
+                    return True
             return False
         
-        # Preprocessor directive
-        if stripped.lstrip().startswith('#'):
+        # Preprocessor - no semicolon
+        first = m[0]
+        if first.spelling == '#':
             return False
         
-        # Check for ++ or -- (not continuation)
-        if len(stripped) >= 2 and stripped[-2:] in ['++', '--']:
-            return True
-        
-        # Continuation character
-        if last_char in '+-*/%&|^=<>,([':
+        # Line starting with comma or closing paren is continuation - no semicolon
+        if first.spelling in (',', ')', ']'):
             return False
-        
-        # Check if line ends with ) and next line starts with ) or , or . (multi-line function call or method chain)
-        if last_char == ')':
-            next_line = self._peek_next_line()
-            if next_line:
-                next_content = next_line.lstrip()
-                if next_content and next_content[0] in '),.':
-                    # Check if next line is dedenting AND we're in a braceless block
-                    next_indent = self._get_indent(next_line)
-                    current_indent = self._get_indent(content) if hasattr(content, '__len__') else 0
-                    # If we're processing a line, we need to get its original indent from the source
-                    if self.current < len(self.lines):
-                        current_indent = self._get_indent(self.lines[self.current])
-                    if next_indent < current_indent:
-                        # Next line is dedenting - check if we're in a braceless block
-                        # If our current indent is in the indent_stack, we're in a braceless block
-                        if current_indent in self.indent_stack:
-                            # We're in a braceless block and dedenting - need semicolon
-                            return True
-                    # Next line continues the call or we're not in braceless block, so no semicolon
-                    return False
         
         return True
     
-    def _is_continuation(self, content: str) -> bool:
-        """Check if line is a continuation"""
-        stripped = content.rstrip()
+    def _push_block(self, ll: LogicalLine, block_type: BlockType):
+        """Push a new block onto the stack"""
+        # Determine the indent of the block content by looking at next logical line
+        # For now, just use current indent + 4 as placeholder
+        # The actual content indent will be determined when we see the next line
         
-        # Remove comments
-        comment_pos = self._find_line_comment(stripped)
-        if comment_pos is not None:
-            stripped = stripped[:comment_pos].rstrip()
+        # Find the next non-blank logical line to get its indent
+        ll_idx = self.logical_lines.index(ll)
+        content_indent = ll.indent + 4  # Default
         
-        if not stripped:
-            return False
+        for next_ll in self.logical_lines[ll_idx + 1:]:
+            if not next_ll.is_blank_or_comment():
+                if next_ll.indent > ll.indent:
+                    content_indent = next_ll.indent
+                break
         
-        # Check for ++ or -- (not continuation)
-        if len(stripped) >= 2 and stripped[-2:] in ['++', '--']:
-            return False
-        
-        last_char = stripped[-1]
-        
-        # Continuation characters
-        if last_char in '+-*/%&|^=<>,([{':
-            return True
-        
-        # String literal continuation - only if next line starts with a string
-        if last_char == '"':
-            next_line = self._peek_next_line()
-            if next_line:
-                next_content = next_line.lstrip()
-                if next_content.startswith('"'):
-                    return True
-        
-        # Check if we have unclosed parentheses or brackets (outside strings)
-        paren_count = self._count_unmatched_parens(stripped)
-        if paren_count > 0:
-            return True
-        
-        # Check if line ends with ) and next line starts with : (constructor initializer list)
-        if last_char == ')':
-            next_line = self._peek_next_line()
-            if next_line:
-                next_content = next_line.lstrip()
-                if next_content.startswith(':'):
-                    return True
-        
-        return False
+        self.indent_stack.append(content_indent)
+        self.block_type_stack.append(block_type)
+        self.whitespace_stack.append(ll.leading_ws)
     
-    def _count_unmatched_parens(self, text: str) -> int:
-        """Count unmatched opening parentheses/brackets outside of strings"""
-        in_string = False
-        string_delim = None
-        paren_depth = 0
-        bracket_depth = 0
+    def _output_closing_brace(self, block_type: BlockType, closing_ws: str = ""):
+        """Output a closing brace with optional semicolon"""
+        needs_semi = block_type in (BlockType.CLASS, BlockType.STRUCT, BlockType.ENUM, BlockType.UNION, BlockType.LAMBDA)
         
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            
-            # Handle escape sequences
-            if i > 0 and text[i-1] == '\\':
-                i += 1
-                continue
-            
-            # Track string state
-            if ch == '"' and not in_string:
-                in_string = True
-                string_delim = '"'
-            elif ch == '"' and in_string and string_delim == '"':
-                in_string = False
-            elif ch == "'" and not in_string:
-                in_string = True
-                string_delim = "'"
-            elif ch == "'" and in_string and string_delim == "'":
-                in_string = False
-            elif not in_string:
-                if ch == '(':
-                    paren_depth += 1
-                elif ch == ')':
-                    paren_depth -= 1
-                elif ch == '[':
-                    bracket_depth += 1
-                elif ch == ']':
-                    bracket_depth -= 1
-            
-            i += 1
+        closing = f"{closing_ws}}}"
+        if needs_semi:
+            closing += ';'
         
-        return max(0, paren_depth + bracket_depth)
+        self.output.append(closing)
     
-    def _find_line_comment(self, text: str) -> Optional[int]:
-        """Find the position of // comment start"""
-        in_string = False
-        for i in range(len(text)):
-            if i > 0 and text[i-1] == '\\':
-                continue
-            if text[i] == '"':
-                in_string = not in_string
-            if not in_string and i + 1 < len(text) and text[i:i+2] == '//':
-                return i
-        return None
+    def _flush_blank_lines(self):
+        """Output any pending blank lines"""
+        if self.pending_blank_lines:
+            # Extract raw lines from tuples (raw, indent, source_line)
+            buffered = []
+            for item in self.pending_blank_lines:
+                if isinstance(item, tuple):
+                    raw = item[0]
+                    src_line = item[2] if len(item) >= 3 else 0
+                    buffered.append((raw, src_line))
+                else:
+                    buffered.append((item, 0))
+            self._emit_buffered_lines(buffered)
+            self.pending_blank_lines = []
+    
+    def _emit_buffered_lines(self, buffered: List[Tuple[str, int]]):
+        """Emit buffered lines (from pending_blank_lines). Can be overridden for line tracking.
+        
+        Args:
+            buffered: List of (raw_line, source_line) tuples
+        """
+        for raw, src_line in buffered:
+            self.output.append(raw)
+    
+    def _emit_raw_lines(self, ll: 'LogicalLine', lines: List[str] = None):
+        """Emit raw lines from a logical line. Can be overridden for line tracking.
+        
+        Args:
+            ll: The logical line (for source line info)
+            lines: Lines to emit (defaults to ll.raw_lines)
+        """
+        if lines is None:
+            lines = ll.raw_lines
+        self.output.extend(lines)
 
 
 # =============================================================================
@@ -1199,6 +1081,12 @@ class TrackedOutputList(list):
     def extend(self, items):
         for item in items:
             self.append(item)
+    
+    def pop(self, index=-1):
+        """Override pop to also remove the corresponding source line entry"""
+        result = super().pop(index)
+        self.source_lines.pop(index)
+        return result
 
 
 class LineMapper:
@@ -1215,33 +1103,77 @@ class LineMapper:
         return output_line
 
 
-class MappingCompiler(Compiler):
-    """Extended compiler that tracks line number mappings at the point of emission"""
+class MappingTokenCompiler(TokenCompiler):
+    """Extended TokenCompiler that tracks line number mappings at the point of emission"""
     
     def __init__(self, lines: List[str]):
         super().__init__(lines)
         self._source_line_context = 1
         self.output = TrackedOutputList(lambda: self._source_line_context)
         self.line_mapper = LineMapper(self.output)
+        # Store the current logical line for proper line tracking
+        self._current_ll = None
+    
+    def _emit_raw_lines(self, ll: 'LogicalLine', lines: List[str] = None):
+        """Override to emit raw lines with proper source line tracking.
+        
+        Each output line is tagged with its corresponding source line number,
+        so multiline logical lines map correctly.
+        
+        Args:
+            ll: The logical line (for source line info)
+            lines: Lines to emit (defaults to ll.raw_lines)
+        """
+        if lines is None:
+            lines = ll.raw_lines
+        for i, line in enumerate(lines):
+            self._source_line_context = ll.start_line + i
+            self.output.append(line)
+    
+    def _emit_buffered_lines(self, buffered: List[Tuple[str, int]]):
+        """Override to emit buffered lines with proper source line tracking.
+        
+        Each buffered line is tagged with its own source line, but the context
+        is restored afterwards so that subsequent emissions use the correct line.
+        
+        Args:
+            buffered: List of (raw_line, source_line) tuples
+        """
+        saved_context = self._source_line_context
+        for raw, src_line in buffered:
+            if src_line > 0:
+                self._source_line_context = src_line
+            self.output.append(raw)
+        # Restore context so subsequent emissions use the current logical line's source line
+        self._source_line_context = saved_context
     
     def compile(self) -> str:
         """Compile the braceless C++ to regular C++, tracking line mappings"""
-        while self.current < len(self.lines):
-            self._source_line_context = self.current + 1
-            self._process_line()
-            self.current += 1
+        for ll in self.logical_lines:
+            # Set context to the start line of this logical line
+            self._source_line_context = ll.start_line
+            self._current_ll = ll
+            self._process_logical_line(ll)
         
+        # Close any remaining blocks - use last line as context
         self._source_line_context = len(self.lines) if self.lines else 1
         saved_blank_lines = self.pending_blank_lines
         self.pending_blank_lines = []
         
         while len(self.indent_stack) > 1:
             self.indent_stack.pop()
-            block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else self.block_type_stack[0]
+            block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else BlockType.NORMAL
             closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
-            self._output_closing_brace(block_type, closing_ws=closing_ws)
+            self._output_closing_brace(block_type, closing_ws)
         
-        self.output.extend(saved_blank_lines)
+        # Output any remaining blank lines - need to handle tuples from pending_blank_lines
+        for item in saved_blank_lines:
+            if isinstance(item, tuple):
+                raw, indent, src_line = item if len(item) == 3 else (item[0], item[1], self._source_line_context)
+                self._source_line_context = src_line
+                self.output.append(raw)
+            else:
+                self.output.append(item)
         
         return '\n'.join(self.output) + '\n'
 
@@ -1447,8 +1379,8 @@ def transpile_file(source_path: str, output_path: str, include_dirs: List[str] =
     # Expand .blh includes recursively
     lines, blh_line_map = expand_blh_includes(source_path, include_dirs)
     
-    # Transpile the expanded content
-    compiler = MappingCompiler(lines)
+    # Transpile the expanded content using the token-based compiler with line tracking
+    compiler = MappingTokenCompiler(lines)
     output = compiler.compile()
     
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -1842,7 +1774,7 @@ def main():
     try:
         # Expand .blh includes and transpile
         lines, _ = expand_blh_includes(filename, include_dirs)
-        compiler = Compiler(lines)
+        compiler = TokenCompiler(lines)
         output = compiler.compile()
         print(output, end='')
     except FileNotFoundError as e:
