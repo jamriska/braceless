@@ -103,7 +103,7 @@ def main():
     # Parse command line arguments
     # Default to blcc.py in the parent folder
     script_dir = Path(__file__).parent
-    default_blcc_path = script_dir.parent.parent / "blcc.py"
+    default_blcc_path = script_dir.parent / "blcc.py"
     
     if len(sys.argv) >= 2:
         blcc_path = sys.argv[1]
