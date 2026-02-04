@@ -58,6 +58,8 @@ int main() {
 
 ## Usage
 
+Use a wrapper that correspond to your compiler: `blclang++`, `blg++`, `blcl`.
+
 ```bash
 blclang++ main.blcpp -o main
 ```
