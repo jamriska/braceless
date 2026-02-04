@@ -58,15 +58,14 @@ int main() {
 
 ## Usage
 
-Use the wrapper that corresponds to your compiler:
+```bash
+blclang++ main.blcpp -o main
+```
 
 ```bash
-# Clang
-blclang++ main.blcpp -o main
-
-# GCC
 blg++ main.blcpp -o main
+```
 
-# MSVC
+```bash
 blcl main.blcpp /Fe:main.exe
 ```
