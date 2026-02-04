@@ -561,14 +561,17 @@ class TokenCompiler:
                 self._emit_buffered_lines(after_blanks)
             else:
                 # Normal dedent - close blocks
-                # Partition blank lines based on their indent vs next line's indent
-                # Blanks with indent < next_indent go BEFORE closing brace (inside block)
-                # Blanks with indent >= next_indent go AFTER closing brace
+                # Partition blank lines: inside block (before }) or after block
+                # A blank line goes inside if:
+                # 1. Its indent is at the block's content level or higher, OR
+                # 2. It's between block content and the dedented line (indent < ll.indent)
                 inside_blanks = []
                 after_blanks = []
+                block_content_indent = self.indent_stack[-1] if len(self.indent_stack) > 1 else 0
                 for item in self.pending_blank_lines:
                     raw, indent, src_line = item if len(item) == 3 else (item[0], item[1], 0)
-                    if indent < ll.indent:
+                    # Either at block level or before the dedented line
+                    if indent >= block_content_indent or indent < ll.indent:
                         inside_blanks.append((raw, src_line))
                     else:
                         after_blanks.append((raw, src_line))
@@ -743,10 +746,28 @@ class TokenCompiler:
             # Not a control structure - use original line without colon
             return self._strip_trailing_colon(ll)
         
-        # Check if condition is already wrapped in parentheses
+        # Check if condition is already fully wrapped in parentheses
         if keyword_end_idx < len(m) and m[keyword_end_idx].spelling == '(':
-            # Already has parens - just strip the colon
-            return self._strip_trailing_colon(ll)
+            # Check if the FIRST opening paren matches the LAST closing paren (right before ':')
+            # This distinguishes "if (a && b):" from "if (a) && b:"
+            # We track when the initial paren is closed, not just any paren reaching 0
+            paren_depth = 0
+            first_paren_closes_at_end = False
+            for i in range(keyword_end_idx, len(m) - 1):  # -1 to exclude ':'
+                if m[i].spelling == '(':
+                    paren_depth += 1
+                elif m[i].spelling == ')':
+                    paren_depth -= 1
+                    if paren_depth == 0:
+                        # The initial paren just closed
+                        if i == len(m) - 2:
+                            # And it closes right before :, so fully wrapped
+                            first_paren_closes_at_end = True
+                        # Either way, break here since the initial paren is now closed
+                        break
+            if first_paren_closes_at_end:
+                # Already has parens around entire condition - just strip the colon
+                return self._strip_trailing_colon(ll)
         
         # Need to wrap the condition in parentheses
         colon_token = m[-1]  # Should be ':'
@@ -845,6 +866,76 @@ class TokenCompiler:
                 lines[colon_line] = before_colon.rstrip() + after_colon
             return '\n'.join(lines)
     
+    def _wrap_condition_for_brace(self, ll: LogicalLine) -> Optional[str]:
+        """
+        Wrap condition in parentheses for control structures ending with {.
+        Returns the transformed line if wrapping was needed, None otherwise.
+        """
+        m = ll.meaningful
+        if not m or m[-1].spelling != '{':
+            return None
+        
+        # Check if first token is a control keyword
+        first = m[0]
+        control_keywords = {'if', 'for', 'while', 'switch'}
+        
+        keyword = None
+        keyword_end_idx = 0
+        
+        if first.kind == TokenKind.KEYWORD:
+            if first.spelling in control_keywords:
+                keyword = first.spelling
+                keyword_end_idx = 1
+            elif first.spelling == 'else' and len(m) > 1:
+                second = m[1]
+                if second.kind == TokenKind.KEYWORD and second.spelling == 'if':
+                    keyword = 'else if'
+                    keyword_end_idx = 2
+        
+        if not keyword:
+            return None
+        
+        # Check if condition is already wrapped in parentheses
+        if keyword_end_idx < len(m) - 1 and m[keyword_end_idx].spelling == '(':
+            # Check if the opening paren matches a closing paren right before '{'
+            paren_depth = 0
+            for i in range(keyword_end_idx, len(m) - 1):  # -1 to exclude '{'
+                if m[i].spelling == '(':
+                    paren_depth += 1
+                elif m[i].spelling == ')':
+                    paren_depth -= 1
+                    if paren_depth == 0 and i == len(m) - 2:
+                        # Already fully wrapped
+                        return None
+        
+        # Need to wrap the condition in parentheses
+        raw_line = ll.raw_lines[0] if ll.raw_lines else ''
+        
+        # Find positions in the raw line
+        keyword_token = m[keyword_end_idx - 1]
+        keyword_end_col = keyword_token.column + len(keyword_token.spelling) - 1
+        
+        brace_token = m[-1]
+        brace_col = brace_token.column - 1  # 0-based
+        
+        # Extract condition from source (between keyword and brace)
+        condition = raw_line[keyword_end_col:brace_col].strip()
+        
+        # Get comment text after brace if any
+        comment_text = ''
+        after_brace = raw_line[brace_col + 1:] if brace_col + 1 < len(raw_line) else ''
+        comment_tokens = [t for t in ll.tokens if t.kind == TokenKind.COMMENT and t.line == ll.start_line]
+        if comment_tokens:
+            comment_col = comment_tokens[0].column - 1
+            comment_text = raw_line[comment_col:]
+        
+        result = f"{ll.leading_ws}{keyword} ({condition}) {{"
+        if comment_text:
+            result += ' ' + comment_text
+        elif after_brace.strip():
+            result += after_brace
+        return result
+    
     def _handle_block_start(self, ll: LogicalLine):
         """Handle a line that starts a braceless block (ends with :)"""
         block_type = self._detect_block_type(ll)
@@ -873,18 +964,25 @@ class TokenCompiler:
                 # Content doesn't have the comment - add it
                 comment_part = ' ' + comment_text
         
+        # Capture any trailing whitespace from before_comment to place after the brace
+        trailing_ws = ''
+        stripped_before = before_comment.rstrip()
+        if len(before_comment) > len(stripped_before):
+            trailing_ws = before_comment[len(stripped_before):]
+        before_comment = stripped_before
+        
         # Check for else/catch - merge with previous closing brace
         if self._is_else_or_catch(ll):
             if self.output and self.output[-1].strip() == '}':
                 self.output.pop()
-                self.output.append(f"{ll.leading_ws}}} {before_comment.lstrip()} {{{comment_part}")
+                self.output.append(f"{ll.leading_ws}}} {before_comment.lstrip()} {{{trailing_ws}{comment_part}")
                 self._flush_blank_lines()
             else:
                 self._flush_blank_lines()
-                self.output.append(f"{before_comment} {{{comment_part}")
+                self.output.append(f"{before_comment} {{{trailing_ws}{comment_part}")
         else:
             # Regular block start
-            self.output.append(f"{before_comment} {{{comment_part}")
+            self.output.append(f"{before_comment} {{{trailing_ws}{comment_part}")
         
         # Track the new block
         self._push_block(ll, block_type)
@@ -893,15 +991,21 @@ class TokenCompiler:
         """Handle a line that ends with opening brace (regular C++ syntax)"""
         # Check for else/catch with regular brace
         if self._is_else_or_catch(ll):
-            content = ' '.join(t.spelling for t in ll.meaningful)
+            # Use original raw line to preserve exact spacing (e.g., std::exception& vs std :: exception &)
+            raw_content = ll.raw_lines[0].strip() if ll.raw_lines else ''
             if self.output and self.output[-1].strip() == '}':
                 self.output.pop()
-                self.output.append(f"{ll.leading_ws}}} {content}")
+                self.output.append(f"{ll.leading_ws}}} {raw_content}")
             else:
-                self.output.append(f"{ll.leading_ws}{content}")
+                self.output.append(f"{ll.leading_ws}{raw_content}")
         else:
-            # Output lines as-is
-            self._emit_raw_lines(ll)
+            # Check if this is a control statement that needs parens around condition
+            wrapped_line = self._wrap_condition_for_brace(ll)
+            if wrapped_line is not None:
+                self.output.append(wrapped_line)
+            else:
+                # Output lines as-is
+                self._emit_raw_lines(ll)
         
         # Track the regular brace block
         self._push_block(ll, BlockType.REGULAR_BRACE)
@@ -918,6 +1022,92 @@ class TokenCompiler:
         
         self._emit_raw_lines(ll)
     
+    def _transform_inline_braceless_lambdas(self, lines: List[str]) -> List[str]:
+        """
+        Transform braceless lambda patterns within raw lines.
+        
+        Detects patterns like [...](...): followed by indented body lines
+        and converts them to braced form.
+        """
+        if len(lines) <= 1:
+            return lines
+        
+        result = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.rstrip()
+            
+            # Check if line ends with ): or ]: (lambda pattern with colon)
+            # Make sure there's a [ somewhere before the : to confirm it's a lambda
+            if stripped.endswith(':') and '[' in stripped:
+                # Check if this looks like a lambda: [...] or [...](...)
+                # Find the last ] before the :
+                colon_pos = len(stripped) - 1
+                bracket_pos = stripped.rfind(']')
+                
+                if bracket_pos >= 0:
+                    between = stripped[bracket_pos + 1:colon_pos].strip()
+                    # Valid lambda patterns: ] followed by : or ](...) followed by :
+                    if between == '' or (between.startswith('(') and between.endswith(')')):
+                        # This is a braceless lambda
+                        # Find the indent of the lambda line
+                        lambda_indent = len(line) - len(line.lstrip())
+                        
+                        # Find the body lines (lines with indent > lambda_indent)
+                        body_start = i + 1
+                        body_end = body_start
+                        
+                        if body_start < len(lines):
+                            first_body_line = lines[body_start]
+                            first_body_indent = len(first_body_line) - len(first_body_line.lstrip())
+                            
+                            if first_body_indent > lambda_indent:
+                                # There is a body - find its extent
+                                body_end = body_start
+                                while body_end < len(lines):
+                                    body_line = lines[body_end]
+                                    if body_line.strip() == '':
+                                        body_end += 1
+                                        continue
+                                    body_line_indent = len(body_line) - len(body_line.lstrip())
+                                    if body_line_indent <= lambda_indent:
+                                        break
+                                    body_end += 1
+                                
+                                if body_end > body_start:
+                                    # Transform the lambda
+                                    # 1. Replace trailing : with {
+                                    new_lambda_line = stripped[:-1] + ' {'
+                                    result.append(line[:lambda_indent] + new_lambda_line.lstrip())
+                                    
+                                    # 2. Process body lines (add semicolons if needed)
+                                    for j in range(body_start, body_end):
+                                        body_line = lines[j]
+                                        body_stripped = body_line.rstrip()
+                                        if body_stripped and not body_stripped.endswith((';', '{', '}', ':')):
+                                            # Check if it's not a continuation
+                                            if not body_stripped.startswith((',', ')', ']')):
+                                                body_line = body_stripped + ';'
+                                                body_indent = len(lines[j]) - len(lines[j].lstrip())
+                                                result.append(' ' * body_indent + body_line.lstrip())
+                                            else:
+                                                result.append(body_line)
+                                        else:
+                                            result.append(body_line)
+                                    
+                                    # 3. Add closing brace at the lambda signature's indent level
+                                    result.append(' ' * lambda_indent + '}')
+                                    
+                                    i = body_end
+                                    continue
+            
+            result.append(line)
+            i += 1
+        
+        return result
+    
     def _handle_statement(self, ll: LogicalLine):
         """Handle a regular statement (add semicolon if needed)"""
         # Check for 'pass' statement - it's a no-op placeholder
@@ -931,10 +1121,13 @@ class TokenCompiler:
             self._emit_raw_lines(ll)
             return
         
+        # Transform any inline braceless lambdas
+        working_lines = self._transform_inline_braceless_lambdas(list(ll.raw_lines))
+        
         # Check if needs semicolon
         if self._needs_semicolon(ll):
             # Add semicolon to the last line
-            modified_lines = list(ll.raw_lines)
+            modified_lines = list(working_lines)
             if modified_lines:
                 last_line_idx = len(modified_lines) - 1
                 last_line = modified_lines[last_line_idx]
@@ -943,16 +1136,22 @@ class TokenCompiler:
                 # Find comment on the last line
                 comment_tokens = [t for t in ll.tokens if t.kind == TokenKind.COMMENT and t.line == last_physical_line]
                 if comment_tokens:
-                    # Has comment - insert semicolon before it
+                    # Has comment - insert semicolon before it, preserving original spacing
                     comment_start = comment_tokens[0].column - 1
                     before_comment = last_line[:comment_start].rstrip()
+                    # Preserve original whitespace between code and comment
+                    code_end = len(last_line[:comment_start].rstrip())
+                    original_spacing = last_line[code_end:comment_start]
                     comment_part = last_line[comment_start:]
-                    modified_lines[last_line_idx] = before_comment + '; ' + comment_part.lstrip()
+                    modified_lines[last_line_idx] = before_comment + ';' + original_spacing + comment_part
                 else:
-                    modified_lines[last_line_idx] = last_line.rstrip() + ';'
+                    # Preserve trailing whitespace after the semicolon
+                    stripped_line = last_line.rstrip()
+                    trailing_ws = last_line[len(stripped_line):] if len(last_line) > len(stripped_line) else ''
+                    modified_lines[last_line_idx] = stripped_line + ';' + trailing_ws
             self._emit_raw_lines(ll, modified_lines)
         else:
-            self._emit_raw_lines(ll)
+            self._emit_raw_lines(ll, working_lines)
     
     def _needs_semicolon(self, ll: LogicalLine) -> bool:
         """Check if a statement needs a semicolon"""
@@ -977,10 +1176,15 @@ class TokenCompiler:
             for i, t in enumerate(m):
                 if t.spelling == '=' and i + 1 < len(m) and m[i + 1].spelling == '{':
                     return True
-            # Lambda with assignment (= [...] pattern)
+            # Lambda patterns that need semicolons
             if has_lambda_pattern(m):
+                # Lambda with assignment (auto f = []() {...})
                 has_equals = any(t.spelling == '=' for t in m)
                 if has_equals:
+                    return True
+                # Lambda in return statement (return []() {...})
+                first_token = m[0]
+                if first_token.kind == TokenKind.KEYWORD and first_token.spelling == 'return':
                     return True
             return False
         
