@@ -296,6 +296,101 @@ class LogicalLine:
             return True
         return False
     
+    def find_block_colon_index(self) -> int:
+        """
+        Find the index of a block-starting colon in the meaningful tokens.
+        Returns -1 if no block colon is found.
+        
+        A block colon is one that:
+        - Is not part of case/default label
+        - Is not an access specifier (public:/private:/protected:)
+        - Is not a ternary operator (a ? b : c)
+        - Is not a scope resolution (::)
+        - Is not inside parentheses (range-based for loop)
+        - Is not an inheritance colon (class Foo : public Bar)
+        
+        For lines with multiple valid colons (like constructor initializer lists
+        followed by braceless block), returns the LAST valid colon.
+        """
+        m = self.meaningful
+        if not m:
+            return -1
+        
+        # Track ternary operators - colons that match a ? are ternary
+        ternary_depth = 0
+        paren_depth = 0
+        candidate_colons = []
+        
+        for i, t in enumerate(m):
+            if t.spelling == '(':
+                paren_depth += 1
+            elif t.spelling == ')':
+                paren_depth -= 1
+            elif t.spelling == '?':
+                ternary_depth += 1
+            elif t.spelling == ':':
+                # Skip :: (scope resolution)
+                if i + 1 < len(m) and m[i + 1].spelling == ':':
+                    continue
+                if i > 0 and m[i - 1].spelling == ':':
+                    continue
+                
+                # Handle ternary colons - consume the ternary even if inside parens
+                if ternary_depth > 0:
+                    ternary_depth -= 1
+                    continue
+                
+                # Skip colons inside parentheses (range-based for loop)
+                if paren_depth > 0:
+                    continue
+                
+                # Skip case/default colons
+                first = m[0]
+                if first.kind == TokenKind.KEYWORD and first.spelling in ('case', 'default'):
+                    continue
+                
+                # Skip access specifier colons (public:/private:/protected:)
+                if i == 1 and m[0].kind == TokenKind.KEYWORD and m[0].spelling in ('public', 'private', 'protected'):
+                    continue
+                
+                # Skip inheritance colons (class Foo : public Bar)
+                # These are followed by public/private/protected keywords
+                if i + 1 < len(m) and m[i + 1].kind == TokenKind.KEYWORD and m[i + 1].spelling in ('public', 'private', 'protected'):
+                    continue
+                
+                # This is a candidate block colon
+                candidate_colons.append(i)
+        
+        # Return the last candidate colon (handles constructor initializer + braceless block)
+        if candidate_colons:
+            return candidate_colons[-1]
+        return -1
+    
+    def has_inline_block(self) -> bool:
+        """
+        Check if this line has an inline block (colon followed by code on same line).
+        e.g., "if x < 0: return 0" or "int pow(int x): return x*x"
+        
+        NOT an inline block if:
+        - Line ends with { or } (has explicit body delimiters)
+        - The content after colon is a constructor initializer list
+        """
+        m = self.meaningful
+        if not m:
+            return False
+        
+        # If line ends with { or }, it has explicit body - not an inline block
+        last = m[-1]
+        if last.spelling in ('{', '}'):
+            return False
+        
+        colon_idx = self.find_block_colon_index()
+        if colon_idx < 0:
+            return False
+        
+        # There must be meaningful tokens after the colon
+        return colon_idx < len(m) - 1
+    
     def __repr__(self):
         return f"LogicalLine(L{self.start_line}, {len(self.raw_lines)} lines, {len(self.tokens)} tokens)"
 
@@ -656,6 +751,11 @@ class TokenCompiler:
             self._handle_regular_brace(ll)
             return
         
+        # Handle inline block (colon followed by code on same line)
+        if ll.has_inline_block():
+            self._handle_inline_block(ll)
+            return
+        
         # Handle block start (ends with colon)
         if ll.is_block_start():
             self._handle_block_start(ll)
@@ -935,6 +1035,99 @@ class TokenCompiler:
         elif after_brace.strip():
             result += after_brace
         return result
+    
+    def _handle_inline_block(self, ll: LogicalLine):
+        """Handle a one-liner block (colon followed by code on same line).
+        
+        e.g., "if x < 0: return 0" -> "if (x < 0) { return 0; }"
+              "int pow(int x): return x*x" -> "int pow(int x) { return x*x; }"
+        """
+        m = ll.meaningful
+        colon_idx = ll.find_block_colon_index()
+        
+        if colon_idx < 0:
+            # Shouldn't happen, but fall back to regular handling
+            self._handle_statement(ll)
+            return
+        
+        # Split into header tokens (before colon) and body tokens (after colon)
+        header_tokens = m[:colon_idx]
+        body_tokens = m[colon_idx + 1:]
+        
+        if not header_tokens:
+            # No header, fall back
+            self._handle_statement(ll)
+            return
+        
+        # Determine if header is a control structure that needs parens
+        first = header_tokens[0]
+        control_keywords = {'if', 'for', 'while', 'switch'}
+        
+        keyword = None
+        keyword_end_idx = 0
+        
+        if first.kind == TokenKind.KEYWORD:
+            if first.spelling in control_keywords:
+                keyword = first.spelling
+                keyword_end_idx = 1
+            elif first.spelling == 'else' and len(header_tokens) > 1:
+                second = header_tokens[1]
+                if second.kind == TokenKind.KEYWORD and second.spelling == 'if':
+                    keyword = 'else if'
+                    keyword_end_idx = 2
+        
+        # Build the header string
+        raw_line = ll.raw_lines[0] if ll.raw_lines else ''
+        colon_token = m[colon_idx]
+        colon_col = colon_token.column - 1  # 0-based
+        
+        if keyword:
+            # Control structure - wrap condition in parens
+            keyword_token = header_tokens[keyword_end_idx - 1]
+            keyword_end_col = keyword_token.column + len(keyword_token.spelling) - 1
+            
+            # Check if already has parens
+            has_parens = False
+            if keyword_end_idx < len(header_tokens) and header_tokens[keyword_end_idx].spelling == '(':
+                # Check if parens wrap entire condition
+                paren_depth = 0
+                for i in range(keyword_end_idx, len(header_tokens)):
+                    if header_tokens[i].spelling == '(':
+                        paren_depth += 1
+                    elif header_tokens[i].spelling == ')':
+                        paren_depth -= 1
+                        if paren_depth == 0 and i == len(header_tokens) - 1:
+                            has_parens = True
+                        break
+            
+            if has_parens:
+                # Already has parens - use raw header
+                header_str = raw_line[:colon_col].rstrip()
+            else:
+                # Need to wrap condition
+                condition = raw_line[keyword_end_col:colon_col].strip()
+                header_str = f"{ll.leading_ws}{keyword} ({condition})"
+        else:
+            # Not a control structure - use raw header
+            header_str = raw_line[:colon_col].rstrip()
+        
+        # Build the body string
+        # Get body from raw line (after colon)
+        body_start_col = colon_col + 1
+        body_str = raw_line[body_start_col:].strip()
+        
+        # Check if body needs semicolon
+        needs_semi = True
+        if body_tokens:
+            last_body = body_tokens[-1]
+            if last_body.spelling in (';', '{', '}'):
+                needs_semi = False
+        
+        if needs_semi:
+            body_str = body_str + ';'
+        
+        # Output the one-liner: "header { body }"
+        self.output.append(f"{header_str} {{ {body_str} }}")
     
     def _handle_block_start(self, ll: LogicalLine):
         """Handle a line that starts a braceless block (ends with :)"""
