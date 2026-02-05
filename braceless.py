@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Braceless C++ Transpiler
+Braceless C++ Compiler
 
 Converts Python-style indented C++ (.blcpp) to regular braced C++ (.cpp).
 
@@ -490,7 +490,7 @@ class TrackedOutputList(list):
         return output_line
 
 
-class TokenCompiler:
+class Compiler:
     """
     Token-based Braceless C++ Compiler.
     
@@ -1510,7 +1510,7 @@ def transpile_file(source_path: str, output_path: str, include_dirs: List[str] =
     lines, blh_line_map = expand_blh_includes(source_path, include_dirs)
     
     # Transpile the expanded content using the token-based compiler with line tracking
-    compiler = TokenCompiler(lines)
+    compiler = Compiler(lines)
     output = compiler.compile()
     
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -1885,7 +1885,7 @@ def compiler_main(compiler_exe: str, args: List[str]):
 
 def print_usage():
     """Print usage information."""
-    print("Braceless C++ Transpiler", file=sys.stderr)
+    print("Braceless C++ Compiler", file=sys.stderr)
     print("", file=sys.stderr)
     print("Usage:", file=sys.stderr)
     print("  braceless <compiler> [compiler options] <source files>", file=sys.stderr)
@@ -1956,7 +1956,7 @@ def main():
     try:
         # Expand .blh includes and transpile
         lines, _ = expand_blh_includes(filename, include_dirs)
-        compiler = TokenCompiler(lines)
+        compiler = Compiler(lines)
         output = compiler.compile()
         print(output, end='')
     except FileNotFoundError as e:
