@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-Braceless C++ Compiler (blcc)
+Braceless C++ Transpiler
 
-Converts Python-style indented C++ to regular braced C++.
+Converts Python-style indented C++ (.blcpp) to regular braced C++ (.cpp).
+
+Usage:
+    braceless <compiler> [compiler options] <source files>
+    braceless <input.blcpp> [-I<include_dir>]...  (transpile only)
+
+Examples:
+    braceless clang++ main.blcpp -o main
+    braceless g++ -O2 -std=c++20 main.blcpp -o main
+    braceless cl.exe /O2 main.blcpp /Fe:main.exe
 """
 
 import sys
@@ -296,101 +305,6 @@ class LogicalLine:
             return True
         return False
     
-    def find_block_colon_index(self) -> int:
-        """
-        Find the index of a block-starting colon in the meaningful tokens.
-        Returns -1 if no block colon is found.
-        
-        A block colon is one that:
-        - Is not part of case/default label
-        - Is not an access specifier (public:/private:/protected:)
-        - Is not a ternary operator (a ? b : c)
-        - Is not a scope resolution (::)
-        - Is not inside parentheses (range-based for loop)
-        - Is not an inheritance colon (class Foo : public Bar)
-        
-        For lines with multiple valid colons (like constructor initializer lists
-        followed by braceless block), returns the LAST valid colon.
-        """
-        m = self.meaningful
-        if not m:
-            return -1
-        
-        # Track ternary operators - colons that match a ? are ternary
-        ternary_depth = 0
-        paren_depth = 0
-        candidate_colons = []
-        
-        for i, t in enumerate(m):
-            if t.spelling == '(':
-                paren_depth += 1
-            elif t.spelling == ')':
-                paren_depth -= 1
-            elif t.spelling == '?':
-                ternary_depth += 1
-            elif t.spelling == ':':
-                # Skip :: (scope resolution)
-                if i + 1 < len(m) and m[i + 1].spelling == ':':
-                    continue
-                if i > 0 and m[i - 1].spelling == ':':
-                    continue
-                
-                # Handle ternary colons - consume the ternary even if inside parens
-                if ternary_depth > 0:
-                    ternary_depth -= 1
-                    continue
-                
-                # Skip colons inside parentheses (range-based for loop)
-                if paren_depth > 0:
-                    continue
-                
-                # Skip case/default colons
-                first = m[0]
-                if first.kind == TokenKind.KEYWORD and first.spelling in ('case', 'default'):
-                    continue
-                
-                # Skip access specifier colons (public:/private:/protected:)
-                if i == 1 and m[0].kind == TokenKind.KEYWORD and m[0].spelling in ('public', 'private', 'protected'):
-                    continue
-                
-                # Skip inheritance colons (class Foo : public Bar)
-                # These are followed by public/private/protected keywords
-                if i + 1 < len(m) and m[i + 1].kind == TokenKind.KEYWORD and m[i + 1].spelling in ('public', 'private', 'protected'):
-                    continue
-                
-                # This is a candidate block colon
-                candidate_colons.append(i)
-        
-        # Return the last candidate colon (handles constructor initializer + braceless block)
-        if candidate_colons:
-            return candidate_colons[-1]
-        return -1
-    
-    def has_inline_block(self) -> bool:
-        """
-        Check if this line has an inline block (colon followed by code on same line).
-        e.g., "if x < 0: return 0" or "int pow(int x): return x*x"
-        
-        NOT an inline block if:
-        - Line ends with { or } (has explicit body delimiters)
-        - The content after colon is a constructor initializer list
-        """
-        m = self.meaningful
-        if not m:
-            return False
-        
-        # If line ends with { or }, it has explicit body - not an inline block
-        last = m[-1]
-        if last.spelling in ('{', '}'):
-            return False
-        
-        colon_idx = self.find_block_colon_index()
-        if colon_idx < 0:
-            return False
-        
-        # There must be meaningful tokens after the colon
-        return colon_idx < len(m) - 1
-    
     def __repr__(self):
         return f"LogicalLine(L{self.start_line}, {len(self.raw_lines)} lines, {len(self.tokens)} tokens)"
 
@@ -546,6 +460,36 @@ class BlockType(Enum):
     DO = auto()  # do-while loop (closing brace merges with while)
 
 
+class TrackedOutputList(list):
+    """A list that tracks source line mappings for each appended item"""
+    
+    def __init__(self, get_source_line_func):
+        super().__init__()
+        self._get_source_line = get_source_line_func
+        self.source_lines: List[int] = []
+    
+    def append(self, item):
+        super().append(item)
+        self.source_lines.append(self._get_source_line())
+    
+    def extend(self, items):
+        for item in items:
+            self.append(item)
+    
+    def pop(self, index=-1):
+        """Override pop to also remove the corresponding source line entry"""
+        result = super().pop(index)
+        self.source_lines.pop(index)
+        return result
+    
+    def get_source_line(self, output_line: int) -> int:
+        """Get the source line for a given output line (1-based)"""
+        idx = output_line - 1
+        if 0 <= idx < len(self.source_lines):
+            return self.source_lines[idx]
+        return output_line
+
+
 class TokenCompiler:
     """
     Token-based Braceless C++ Compiler.
@@ -570,8 +514,10 @@ class TokenCompiler:
         self.block_type_stack = [BlockType.NORMAL]
         self.whitespace_stack = ['']  # Track whitespace for closing braces
         
-        # Output
-        self.output = []
+        # Output with line tracking
+        self._source_line_context = 1
+        self.output = TrackedOutputList(lambda: self._source_line_context)
+        self._current_ll = None
         
         # Pending blank lines (for proper placement around closing braces)
         self.pending_blank_lines = []
@@ -580,11 +526,15 @@ class TokenCompiler:
         self._do_while_handled = False
     
     def compile(self) -> str:
-        """Compile the braceless C++ to regular C++"""
+        """Compile the braceless C++ to regular C++, tracking line mappings"""
         for ll in self.logical_lines:
+            # Set context to the start line of this logical line
+            self._source_line_context = ll.start_line
+            self._current_ll = ll
             self._process_logical_line(ll)
         
-        # Close any remaining blocks
+        # Close any remaining blocks - use last line as context
+        self._source_line_context = len(self.lines) if self.lines else 1
         saved_blank_lines = self.pending_blank_lines
         self.pending_blank_lines = []
         
@@ -594,17 +544,14 @@ class TokenCompiler:
             closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
             self._output_closing_brace(block_type, closing_ws)
         
-        # Output any remaining blank lines
-        if saved_blank_lines:
-            buffered = []
-            for item in saved_blank_lines:
-                if isinstance(item, tuple):
-                    raw = item[0]
-                    src_line = item[2] if len(item) >= 3 else 0
-                    buffered.append((raw, src_line))
-                else:
-                    buffered.append((item, 0))
-            self._emit_buffered_lines(buffered)
+        # Output any remaining blank lines - need to handle tuples from pending_blank_lines
+        for item in saved_blank_lines:
+            if isinstance(item, tuple):
+                raw, indent, src_line = item if len(item) == 3 else (item[0], item[1], self._source_line_context)
+                self._source_line_context = src_line
+                self.output.append(raw)
+            else:
+                self.output.append(item)
         
         return '\n'.join(self.output) + '\n'
     
@@ -749,11 +696,6 @@ class TokenCompiler:
         # Handle line ending with opening brace (regular C++ brace)
         if ll.ends_with_brace():
             self._handle_regular_brace(ll)
-            return
-        
-        # Handle inline block (colon followed by code on same line)
-        if ll.has_inline_block():
-            self._handle_inline_block(ll)
             return
         
         # Handle block start (ends with colon)
@@ -1036,99 +978,6 @@ class TokenCompiler:
             result += after_brace
         return result
     
-    def _handle_inline_block(self, ll: LogicalLine):
-        """Handle a one-liner block (colon followed by code on same line).
-        
-        e.g., "if x < 0: return 0" -> "if (x < 0) { return 0; }"
-              "int pow(int x): return x*x" -> "int pow(int x) { return x*x; }"
-        """
-        m = ll.meaningful
-        colon_idx = ll.find_block_colon_index()
-        
-        if colon_idx < 0:
-            # Shouldn't happen, but fall back to regular handling
-            self._handle_statement(ll)
-            return
-        
-        # Split into header tokens (before colon) and body tokens (after colon)
-        header_tokens = m[:colon_idx]
-        body_tokens = m[colon_idx + 1:]
-        
-        if not header_tokens:
-            # No header, fall back
-            self._handle_statement(ll)
-            return
-        
-        # Determine if header is a control structure that needs parens
-        first = header_tokens[0]
-        control_keywords = {'if', 'for', 'while', 'switch'}
-        
-        keyword = None
-        keyword_end_idx = 0
-        
-        if first.kind == TokenKind.KEYWORD:
-            if first.spelling in control_keywords:
-                keyword = first.spelling
-                keyword_end_idx = 1
-            elif first.spelling == 'else' and len(header_tokens) > 1:
-                second = header_tokens[1]
-                if second.kind == TokenKind.KEYWORD and second.spelling == 'if':
-                    keyword = 'else if'
-                    keyword_end_idx = 2
-        
-        # Build the header string
-        raw_line = ll.raw_lines[0] if ll.raw_lines else ''
-        colon_token = m[colon_idx]
-        colon_col = colon_token.column - 1  # 0-based
-        
-        if keyword:
-            # Control structure - wrap condition in parens
-            keyword_token = header_tokens[keyword_end_idx - 1]
-            keyword_end_col = keyword_token.column + len(keyword_token.spelling) - 1
-            
-            # Check if already has parens
-            has_parens = False
-            if keyword_end_idx < len(header_tokens) and header_tokens[keyword_end_idx].spelling == '(':
-                # Check if parens wrap entire condition
-                paren_depth = 0
-                for i in range(keyword_end_idx, len(header_tokens)):
-                    if header_tokens[i].spelling == '(':
-                        paren_depth += 1
-                    elif header_tokens[i].spelling == ')':
-                        paren_depth -= 1
-                        if paren_depth == 0 and i == len(header_tokens) - 1:
-                            has_parens = True
-                        break
-            
-            if has_parens:
-                # Already has parens - use raw header
-                header_str = raw_line[:colon_col].rstrip()
-            else:
-                # Need to wrap condition
-                condition = raw_line[keyword_end_col:colon_col].strip()
-                header_str = f"{ll.leading_ws}{keyword} ({condition})"
-        else:
-            # Not a control structure - use raw header
-            header_str = raw_line[:colon_col].rstrip()
-        
-        # Build the body string
-        # Get body from raw line (after colon)
-        body_start_col = colon_col + 1
-        body_str = raw_line[body_start_col:].strip()
-        
-        # Check if body needs semicolon
-        needs_semi = True
-        if body_tokens:
-            last_body = body_tokens[-1]
-            if last_body.spelling in (';', '{', '}'):
-                needs_semi = False
-        
-        if needs_semi:
-            body_str = body_str + ';'
-        
-        # Output the one-liner: "header { body }"
-        self.output.append(f"{header_str} {{ {body_str} }}")
-    
     def _handle_block_start(self, ll: LogicalLine):
         """Handle a line that starts a braceless block (ends with :)"""
         block_type = self._detect_block_type(ll)
@@ -1291,7 +1140,17 @@ class TokenCompiler:
                                             result.append(body_line)
                                     
                                     # 3. Add closing brace at the lambda signature's indent level
-                                    result.append(' ' * lambda_indent + '}')
+                                    # Check if next line is punctuation-only at same indent (attach to brace)
+                                    closing_brace = ' ' * lambda_indent + '}'
+                                    if body_end < len(lines):
+                                        next_line = lines[body_end]
+                                        next_stripped = next_line.strip()
+                                        next_indent = len(next_line) - len(next_line.lstrip())
+                                        # Attach punctuation if at same indent and is punctuation-only
+                                        if next_indent == lambda_indent and next_stripped in (',', ')', ']', ');', '],'):
+                                            closing_brace += next_stripped
+                                            body_end += 1  # Skip this line since we consumed it
+                                    result.append(closing_brace)
                                     
                                     i = body_end
                                     continue
@@ -1438,97 +1297,7 @@ class TokenCompiler:
             self.pending_blank_lines = []
     
     def _emit_buffered_lines(self, buffered: List[Tuple[str, int]]):
-        """Emit buffered lines (from pending_blank_lines). Can be overridden for line tracking.
-        
-        Args:
-            buffered: List of (raw_line, source_line) tuples
-        """
-        for raw, src_line in buffered:
-            self.output.append(raw)
-    
-    def _emit_raw_lines(self, ll: 'LogicalLine', lines: List[str] = None):
-        """Emit raw lines from a logical line. Can be overridden for line tracking.
-        
-        Args:
-            ll: The logical line (for source line info)
-            lines: Lines to emit (defaults to ll.raw_lines)
-        """
-        if lines is None:
-            lines = ll.raw_lines
-        self.output.extend(lines)
-
-
-# =============================================================================
-# Compiler Wrapper Infrastructure
-# =============================================================================
-
-
-class TrackedOutputList(list):
-    """A list that tracks source line mappings for each appended item"""
-    
-    def __init__(self, get_source_line_func):
-        super().__init__()
-        self._get_source_line = get_source_line_func
-        self.source_lines: List[int] = []
-    
-    def append(self, item):
-        super().append(item)
-        self.source_lines.append(self._get_source_line())
-    
-    def extend(self, items):
-        for item in items:
-            self.append(item)
-    
-    def pop(self, index=-1):
-        """Override pop to also remove the corresponding source line entry"""
-        result = super().pop(index)
-        self.source_lines.pop(index)
-        return result
-
-
-class LineMapper:
-    """Provides source line lookup from tracked output"""
-    
-    def __init__(self, tracked_output: TrackedOutputList):
-        self._tracked_output = tracked_output
-    
-    def get_source_line(self, output_line: int) -> int:
-        """Get the source line for a given output line (1-based)"""
-        idx = output_line - 1
-        if 0 <= idx < len(self._tracked_output.source_lines):
-            return self._tracked_output.source_lines[idx]
-        return output_line
-
-
-class MappingTokenCompiler(TokenCompiler):
-    """Extended TokenCompiler that tracks line number mappings at the point of emission"""
-    
-    def __init__(self, lines: List[str]):
-        super().__init__(lines)
-        self._source_line_context = 1
-        self.output = TrackedOutputList(lambda: self._source_line_context)
-        self.line_mapper = LineMapper(self.output)
-        # Store the current logical line for proper line tracking
-        self._current_ll = None
-    
-    def _emit_raw_lines(self, ll: 'LogicalLine', lines: List[str] = None):
-        """Override to emit raw lines with proper source line tracking.
-        
-        Each output line is tagged with its corresponding source line number,
-        so multiline logical lines map correctly.
-        
-        Args:
-            ll: The logical line (for source line info)
-            lines: Lines to emit (defaults to ll.raw_lines)
-        """
-        if lines is None:
-            lines = ll.raw_lines
-        for i, line in enumerate(lines):
-            self._source_line_context = ll.start_line + i
-            self.output.append(line)
-    
-    def _emit_buffered_lines(self, buffered: List[Tuple[str, int]]):
-        """Override to emit buffered lines with proper source line tracking.
+        """Emit buffered lines with proper source line tracking.
         
         Each buffered line is tagged with its own source line, but the context
         is restored afterwards so that subsequent emissions use the correct line.
@@ -1544,35 +1313,26 @@ class MappingTokenCompiler(TokenCompiler):
         # Restore context so subsequent emissions use the current logical line's source line
         self._source_line_context = saved_context
     
-    def compile(self) -> str:
-        """Compile the braceless C++ to regular C++, tracking line mappings"""
-        for ll in self.logical_lines:
-            # Set context to the start line of this logical line
-            self._source_line_context = ll.start_line
-            self._current_ll = ll
-            self._process_logical_line(ll)
+    def _emit_raw_lines(self, ll: 'LogicalLine', lines: List[str] = None):
+        """Emit raw lines with proper source line tracking.
         
-        # Close any remaining blocks - use last line as context
-        self._source_line_context = len(self.lines) if self.lines else 1
-        saved_blank_lines = self.pending_blank_lines
-        self.pending_blank_lines = []
+        Each output line is tagged with its corresponding source line number,
+        so multiline logical lines map correctly.
         
-        while len(self.indent_stack) > 1:
-            self.indent_stack.pop()
-            block_type = self.block_type_stack.pop() if len(self.block_type_stack) > 1 else BlockType.NORMAL
-            closing_ws = self.whitespace_stack.pop() if len(self.whitespace_stack) > 1 else ''
-            self._output_closing_brace(block_type, closing_ws)
-        
-        # Output any remaining blank lines - need to handle tuples from pending_blank_lines
-        for item in saved_blank_lines:
-            if isinstance(item, tuple):
-                raw, indent, src_line = item if len(item) == 3 else (item[0], item[1], self._source_line_context)
-                self._source_line_context = src_line
-                self.output.append(raw)
-            else:
-                self.output.append(item)
-        
-        return '\n'.join(self.output) + '\n'
+        Args:
+            ll: The logical line (for source line info)
+            lines: Lines to emit (defaults to ll.raw_lines)
+        """
+        if lines is None:
+            lines = ll.raw_lines
+        for i, line in enumerate(lines):
+            self._source_line_context = ll.start_line + i
+            self.output.append(line)
+
+
+# =============================================================================
+# Compiler Wrapper Infrastructure
+# =============================================================================
 
 
 class ErrorFormat(Enum):
@@ -1727,43 +1487,16 @@ def extract_include_dirs(args: List[str]) -> List[str]:
     return include_dirs
 
 
-class SourceLocationMapper:
-    """Maps transpiled line numbers back to original source file locations.
-    
-    This handles the case where .blh files have been expanded inline,
-    so errors can be reported with the correct original file and line.
-    """
-    
-    def __init__(self, blh_line_map: Dict[int, Tuple[str, int]], transpile_mapper: LineMapper):
-        """
-        Args:
-            blh_line_map: Maps expanded_line -> (original_file, original_line)
-            transpile_mapper: Maps transpiled_line -> expanded_line
-        """
-        self._blh_map = blh_line_map
-        self._transpile_mapper = transpile_mapper
-    
-    def get_source_location(self, transpiled_line: int) -> Tuple[str, int]:
-        """Get the original source file and line for a transpiled line number.
-        
-        Returns:
-            Tuple of (original_file_path, original_line_number)
-        """
-        # First map transpiled line to expanded line
-        expanded_line = self._transpile_mapper.get_source_line(transpiled_line)
-        # Then map expanded line to original source location
-        if expanded_line in self._blh_map:
-            return self._blh_map[expanded_line]
-        # Fallback: return unknown location
-        return ("<unknown>", expanded_line)
+# SourceMapping: List where index i contains (original_file, original_line) for output line i+1
+SourceMapping = List[Tuple[str, int]]
 
 
-def transpile_file(source_path: str, output_path: str, include_dirs: List[str] = None) -> SourceLocationMapper:
+def transpile_file(source_path: str, output_path: str, include_dirs: List[str] = None) -> SourceMapping:
     """Transpile a braceless C++ file to regular C++.
     
     This function expands any #include "*.blh" directives, transpiles the
-    combined braceless code to braced C++, and returns a mapper that can
-    translate transpiled line numbers back to original source locations.
+    combined braceless code to braced C++, and returns a mapping from output
+    line numbers back to original source locations.
     
     Args:
         source_path: Path to the .blcpp source file
@@ -1771,20 +1504,27 @@ def transpile_file(source_path: str, output_path: str, include_dirs: List[str] =
         include_dirs: Additional directories to search for .blh headers
         
     Returns:
-        SourceLocationMapper for mapping error line numbers back to original files
+        SourceMapping list for mapping output lines to (original_file, original_line)
     """
     # Expand .blh includes recursively
     lines, blh_line_map = expand_blh_includes(source_path, include_dirs)
     
     # Transpile the expanded content using the token-based compiler with line tracking
-    compiler = MappingTokenCompiler(lines)
+    compiler = TokenCompiler(lines)
     output = compiler.compile()
     
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(output)
     
-    # Return a mapper that chains: transpiled_line -> expanded_line -> (file, line)
-    return SourceLocationMapper(blh_line_map, compiler.line_mapper)
+    # Build the full mapping: output_line -> (original_file, original_line)
+    source_mapping = []
+    for expanded_line in compiler.output.source_lines:
+        if expanded_line in blh_line_map:
+            source_mapping.append(blh_line_map[expanded_line])
+        else:
+            source_mapping.append(("<unknown>", expanded_line))
+    
+    return source_mapping
 
 
 def expand_response_file(response_file: str) -> List[str]:
@@ -1931,7 +1671,7 @@ def _paths_match(path1: str, path2: str) -> bool:
     return os.path.basename(path1).lower() == os.path.basename(path2).lower()
 
 
-def _build_basename_map(file_mappings: Dict[str, SourceLocationMapper]) -> Dict[str, str]:
+def _build_basename_map(file_mappings: Dict[str, SourceMapping]) -> Dict[str, str]:
     """Build a map of basenames to temp paths"""
     basename_to_temp = {}
     for temp_path in file_mappings:
@@ -1941,9 +1681,17 @@ def _build_basename_map(file_mappings: Dict[str, SourceLocationMapper]) -> Dict[
     return basename_to_temp
 
 
+def _get_source_location(mapping: SourceMapping, transpiled_line: int) -> Tuple[str, int]:
+    """Get the original source file and line for a transpiled line number."""
+    idx = transpiled_line - 1
+    if 0 <= idx < len(mapping):
+        return mapping[idx]
+    return ("<unknown>", transpiled_line)
+
+
 def patch_compiler_output(
     output: str,
-    file_mappings: Dict[str, SourceLocationMapper],
+    file_mappings: Dict[str, SourceMapping],
     error_format: ErrorFormat
 ) -> str:
     """Patch compiler output to map line numbers back to original source files.
@@ -1953,7 +1701,7 @@ def patch_compiler_output(
     
     Args:
         output: Compiler stdout or stderr
-        file_mappings: Maps temp_cpp_path -> SourceLocationMapper
+        file_mappings: Maps temp_cpp_path -> SourceMapping
         error_format: MSVC or GNU error message format
         
     Returns:
@@ -1983,9 +1731,9 @@ def patch_compiler_output(
                     matched_temp_path = basename_to_temp[basename]
             
             if matched_temp_path:
-                mapper = file_mappings[matched_temp_path]
+                mapping = file_mappings[matched_temp_path]
                 # Get the original source file and line
-                original_path, source_line = mapper.get_source_location(line_num)
+                original_path, source_line = _get_source_location(mapping, line_num)
                 
                 if error_format == ErrorFormat.MSVC:
                     column_part = match.group(3) or ''
@@ -2087,45 +1835,44 @@ def run_compiler_wrapper(
             print(f"[{wrapper_name}] Keeping temp directory: {temp_dir}", file=sys.stderr)
 
 
-# Compiler configurations: (compiler_exe, error_format, parse_args_func)
-COMPILERS = {
-    'blcl':       ('cl.exe',    ErrorFormat.MSVC, parse_msvc_args),
-    'blclang-cl': ('clang-cl',  ErrorFormat.MSVC, parse_msvc_args),
-    'blgcc':      ('gcc',       ErrorFormat.GNU,  parse_gnu_args),
-    'blg++':      ('g++',       ErrorFormat.GNU,  parse_gnu_args),
-    'blclang':    ('clang',     ErrorFormat.GNU,  parse_gnu_args),
-    'blclang++':  ('clang++',   ErrorFormat.GNU,  parse_gnu_args),
-    'blemcc':     ('emcc',      ErrorFormat.GNU,  parse_gnu_args),
-    'blem++':     ('em++',      ErrorFormat.GNU,  parse_gnu_args),
+# Compiler configurations: maps compiler executable to (error_format, parse_args_func)
+COMPILER_CONFIGS = {
+    # MSVC-style compilers
+    'cl':         (ErrorFormat.MSVC, parse_msvc_args),
+    'cl.exe':     (ErrorFormat.MSVC, parse_msvc_args),
+    'clang-cl':   (ErrorFormat.MSVC, parse_msvc_args),
+    # GNU-style compilers
+    'gcc':        (ErrorFormat.GNU, parse_gnu_args),
+    'g++':        (ErrorFormat.GNU, parse_gnu_args),
+    'clang':      (ErrorFormat.GNU, parse_gnu_args),
+    'clang++':    (ErrorFormat.GNU, parse_gnu_args),
+    'emcc':       (ErrorFormat.GNU, parse_gnu_args),
+    'em++':       (ErrorFormat.GNU, parse_gnu_args),
 }
 
-
-def wrapper_main(wrapper_name: str):
-    """Main entry point for compiler wrappers."""
-    if wrapper_name not in COMPILERS:
-        print(f"Unknown wrapper: {wrapper_name}", file=sys.stderr)
-        sys.exit(1)
+def compiler_main(compiler_exe: str, args: List[str]):
+    """Main entry point when invoked with a compiler."""
+    # Look up compiler configuration
+    compiler_name = os.path.basename(compiler_exe).lower()
     
-    compiler_exe, error_format, parse_args_func = COMPILERS[wrapper_name]
+    # Try to find config - check with and without .exe extension
+    config = COMPILER_CONFIGS.get(compiler_name)
+    if config is None and compiler_name.endswith('.exe'):
+        config = COMPILER_CONFIGS.get(compiler_name[:-4])  # Try without .exe
     
-    if len(sys.argv) < 2:
-        print(f"{wrapper_name} - Braceless C++ wrapper for {compiler_exe}", file=sys.stderr)
-        print(f"Usage: {wrapper_name} [{compiler_exe} options] <source files>", file=sys.stderr)
-        print(f"       Accepts .blcpp files (braceless C++) in addition to regular C++ files", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("Options:", file=sys.stderr)
-        print("  --verbose    Show verbose output", file=sys.stderr)
-        print("  --keep-temp  Don't delete temporary transpiled files", file=sys.stderr)
-        sys.exit(1)
-    
-    args = sys.argv[1:]
+    if config is None:
+        # Unknown compiler - assume GNU-style as default
+        error_format = ErrorFormat.GNU
+        parse_args_func = parse_gnu_args
+    else:
+        error_format, parse_args_func = config
     
     verbose = '--verbose' in args
     keep_temp = '--keep-temp' in args
     args = [arg for arg in args if arg not in ('--verbose', '--keep-temp')]
     
     exit_code = run_compiler_wrapper(
-        wrapper_name=wrapper_name,
+        wrapper_name='braceless',
         compiler_exe=compiler_exe,
         args=args,
         parse_args_func=parse_args_func,
@@ -2136,21 +1883,59 @@ def wrapper_main(wrapper_name: str):
     sys.exit(exit_code)
 
 
+def print_usage():
+    """Print usage information."""
+    print("Braceless C++ Transpiler", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Usage:", file=sys.stderr)
+    print("  braceless <compiler> [compiler options] <source files>", file=sys.stderr)
+    print("  braceless <input.blcpp> [-I<include_dir>]...  (transpile only)", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Examples:", file=sys.stderr)
+    print("  braceless clang++ main.blcpp -o main", file=sys.stderr)
+    print("  braceless g++ -O2 -std=c++20 main.blcpp -o main", file=sys.stderr)
+    print("  braceless cl.exe /O2 main.blcpp /Fe:main.exe", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Supported compilers: clang++, clang, g++, gcc, cl.exe, clang-cl, emcc, em++", file=sys.stderr)
+    print("(Other compilers will be treated as GNU-style by default)", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Options:", file=sys.stderr)
+    print("  --verbose    Show verbose output", file=sys.stderr)
+    print("  --keep-temp  Don't delete temporary transpiled files", file=sys.stderr)
+
+
+def is_compiler_name(arg: str) -> bool:
+    """Check if an argument looks like a compiler executable."""
+    # Known compilers
+    known = {'clang++', 'clang', 'g++', 'gcc', 'cl', 'cl.exe', 'clang-cl', 'emcc', 'em++'}
+    base = os.path.basename(arg).lower()
+    if base in known:
+        return True
+    # Also accept paths to executables that end with known compiler names
+    if any(base.endswith(c) or base.endswith(c + '.exe') for c in known):
+        return True
+    # Accept things that look like compiler paths (contain ++ or end with cc/cl)
+    if '++' in base or base.endswith('cc') or base.endswith('cl') or base.endswith('cl.exe'):
+        return True
+    return False
+
+
 def main():
-    # Check if invoked as a compiler wrapper
-    if len(sys.argv) >= 3 and sys.argv[1] == '--wrapper':
-        wrapper_name = sys.argv[2]
-        sys.argv = [sys.argv[0]] + sys.argv[3:]  # Remove --wrapper and name from args
-        wrapper_main(wrapper_name)
-        return
-    
-    # Otherwise, run as transpiler
     if len(sys.argv) < 2:
-        print("Usage: blcc <input.blcpp> [-I<include_dir>]...", file=sys.stderr)
-        print("       blcc --wrapper <name> [compiler options] <source files>", file=sys.stderr)
+        print_usage()
         sys.exit(1)
     
-    # Parse arguments
+    first_arg = sys.argv[1]
+    
+    # Check if first argument is a compiler
+    if is_compiler_name(first_arg):
+        # Invoked as: braceless <compiler> [args]
+        compiler_exe = first_arg
+        args = sys.argv[2:]
+        compiler_main(compiler_exe, args)
+        return
+    
+    # Otherwise, run as transpiler (braceless <file.blcpp> [-I...])
     filename = None
     include_dirs = []
     

@@ -4,6 +4,22 @@ Braceless C++ is a dialect of C++ that uses Python-style indentation instead of 
 
 It compiles to standard C++ and comes with wrappers for Clang, GCC, and MSVC. Since you can mix indentation and braces freely in the same file, you can adopt the braceless style one function at a time. Trailing semicolons and parentheses in control structures are optional.
 
+## Usage
+
+```bash
+braceless clang++ main.blcpp -o main
+```
+
+```bash
+braceless g++ main.blcpp -o main
+```
+
+```bash
+braceless cl.exe main.blcpp /Fe:main.exe
+```
+
+## Example
+
 <table>
 <tr>
 <th>Braceless C++</th>
@@ -55,19 +71,3 @@ int main() {
 </td>
 </tr>
 </table>
-
-## Usage
-
-Use one of the provided compiler wrappers: `blclang++`, `blg++`, or `blcl`.
-
-```bash
-blclang++ main.blcpp -o main
-```
-
-```bash
-blg++ main.blcpp -o main
-```
-
-```bash
-blcl main.blcpp /Fe:main.exe
-```
