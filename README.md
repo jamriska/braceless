@@ -10,14 +10,6 @@ It compiles to standard C++ and comes with wrappers for Clang, GCC, and MSVC. Si
 braceless clang++ main.blcpp -o main
 ```
 
-```bash
-braceless g++ main.blcpp -o main
-```
-
-```bash
-braceless cl.exe main.blcpp /Fe:main.exe
-```
-
 ## Example
 
 <table>
