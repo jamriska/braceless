@@ -1,0 +1,24 @@
+// Test: Inline braceless lambdas within expressions
+// Multiple sequential lambdas passed to a function
+
+template<typename F, typename G>
+auto combine(F f, G g) {
+    return [=](int x) {
+        return f(g(x));
+    };
+}
+
+int main() {
+    // Multiple lambdas in one function call
+    auto combined = combine(
+        [](int x) {
+            return x * 2;
+        },
+        [](int y) {
+            return y + 1;
+        }
+    );
+    
+    int result = combined(5);
+    return result;
+}

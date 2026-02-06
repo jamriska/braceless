@@ -1,0 +1,16 @@
+// Test: Deeply nested braceless lambdas (3 levels)
+
+int main():
+    auto outer = [](auto f):
+        return [=](auto g):
+            return [=](int x):
+                return f(g(x))
+    
+    auto add_one = [](int x):
+        return x + 1
+    
+    auto mul_two = [](int x):
+        return x * 2
+    
+    auto composed = outer(add_one)(mul_two)
+    return composed(5)

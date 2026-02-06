@@ -1,0 +1,18 @@
+// Test: Nested braceless lambdas
+// A lambda inside another lambda's body
+
+int main() {
+    // Outer lambda that takes a function and applies it
+    auto apply_twice = [](auto f) {
+        return [=](int x) {
+            return f(f(x));
+        };
+    };
+    
+    auto doubler = [](int x) {
+        return x * 2;
+    };
+    
+    auto quad = apply_twice(doubler);
+    return quad(3);
+}
